@@ -1,5 +1,10 @@
 # Production Host Setup Recommendations
 
+Firecracker relies on KVM and on the processor virtualization features
+for workload isolation. Security guarantees and defense in depth can only be
+upheld, if the following list of recommendations are implemented in
+production.
+
 ## Firecracker Configuration
 
 ### Seccomp
@@ -77,8 +82,12 @@ for Firecracker processes that are unresponsive, and kills them, by SIGKILL.
 
 ## Jailer Configuration
 
-Using Jailer in a production Firecracker deployment is highly recommended,
-as it provides additional security boundaries for the microVM.
+For assuring secure isolation in production deployments, Firecracker should
+must be started using the `jailer` binary that's part of each Firecracker
+release, or executed under process constraints equal or more restrictive than
+those in the jailer. For more about Firecracker sandboxing please see
+[Firecracker design](design.md)
+
 The Jailer process applies
 [cgroup](https://www.kernel.org/doc/Documentation/cgroup-v1/cgroups.txt),
 namespace isolation and drops privileges of the Firecracker process.
@@ -156,6 +165,36 @@ Additional details of Jailer features can be found in the
 [Jailer documentation](jailer.md).
 
 ## Host Security Configuration
+
+### Constrain CPU overhead caused by kvm-pit kernel threads
+
+The current implementation results in host CPU usage increase on x86 CPUs when
+a guest injects timer interrupts with the help of kvm-pit kernel thread.
+kvm-pit kthread is by default part of the root cgroup.
+
+To mitigate the CPU overhead we recommend two system level configurations.
+
+1.
+    Use an external agent to move the `kvm-pit/<pid of firecracker>` kernel
+    thread in the microVM’s cgroup (e.g., created by the Jailer).
+    This cannot be done by Firecracker since the thread is created by the Linux
+    kernel after guest start, at which point Firecracker is de-privileged.
+1.
+    Configure the kvm limit to a lower value. This is a system-wide
+    configuration available to users without Firecracker or Jailer changes.
+    However, the same limit applies to APIC timer events, and users will need
+    to test their workloads in order to apply this mitigation.
+
+To modify the kvm limit for interrupts that can be injected in a second.
+
+1. `sudo modprobe -r (kvm_intel|kvm_amd) kvm`
+1. `sudo modprobe kvm min_timer_period_us={new_value}`
+1. `sudo modprobe (kvm_intel|kvm_amd)`
+
+To have this change persistent across boots we can append the option to
+`/etc/modprobe.d/kvm.conf`:
+
+`echo "options kvm min_timer_period_us=" >> /etc/modprobe.d/kvm.conf`
 
 ### Mitigating Network flooding issues
 
@@ -256,18 +295,27 @@ echo "KSM: ENABLED (Recommendation: DISABLED)"
 
 ##### Branch Target Injection mitigation (Spectre V2)
 
-**Intel and AMD** Use a kernel compiled with retpoline and run on hardware with microcode
-supporting conditional Indirect Branch Prediction Barriers (IBPB) and
+**Intel and AMD**
+Where available, Intel recommends using Enhanced Indirect Branch Restricted
+Speculation (eIBRS) together with microcode supporting conditional
+Indirect Branch Prediction Barriers (IBPB).
+
+If eIBRS is not available, use a kernel compiled with retpoline and run on
+hardware with microcode supporting IBPB and
 Indirect Branch Restricted Speculation (IBRS).
 
 Verification can be done by running:
 
 ```bash
-(grep -Eq '^Mitigation: Full [[:alpha:]]+ retpoline, \
+(grep -Eq '^Mitigation: Full [[:alpha:]]+ retpoline,
 IBPB: conditional, IBRS_FW' \
 /sys/devices/system/cpu/vulnerabilities/spectre_v2 && \
 echo "retpoline, IBPB, IBRS: ENABLED (OK)") \
-|| echo "retpoline, IBPB, IBRS: DISABLED (Recommendation: ENABLED)"
+|| (grep -Eq '^Mitigation: Enhanced IBRS,
+IBPB: conditional' \
+/sys/devices/system/cpu/vulnerabilities/spectre_v2 && \
+echo "eIBRS, IBPB: ENABLED (OK)") \
+|| echo "eIBRS, IBPB: DISABLED (Recommendation: ENABLED)"
 ```
 
 **ARM** The mitigations for ARM systems are patched in all linux stable versions
@@ -282,6 +330,17 @@ Verification can be done by running:
 grep -q "^Not affected$" /sys/devices/system/cpu/vulnerabilities/spectre_v2) && \
 echo "SPECTRE V2 -> OK" || echo "SPECTRE V2 -> NOT OK"
 ```
+
+##### Spectre-BHB
+
+**All hosts** Use latest default SpectreV2 mitigations by keeping kernels up to
+date. Additionally, use a host kernel that has unprivileged BPF disabled by
+enabling `BPF_UNPRIV_DEFAULT_OFF` in the kernel config or by writing `1` or `2`
+to `/proc/sys/kernel/unprivileged_bpf_disabled`.
+
+**Intel** . For an extra layer of security, while trading off performance, you
+can add `spectrev2=eibrs,lfence` or more strictly, `spectrev2=eibrs,retpoline`
+to the kernel commandline of the host.
 
 ##### Bounds Check Bypass Store (Spectre V1)
 
@@ -334,7 +393,7 @@ spec_store_bypass_disable=seccomp
 which will apply SSB if seccomp is enabled by Firecracker.
 
 On aarch64 systems, it is enabled by Firecracker
-[using the `prctl` interface][3]. However, this is only availabe on host
+[using the `prctl` interface][3]. However, this is only available on host
 kernels Linux >=4.17 and also Amazon Linux 4.14. Alternatively, a global
 mitigation can be enabled by adding the following Linux kernel boot parameter:
 

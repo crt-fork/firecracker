@@ -293,9 +293,7 @@ impl MMIODeviceManager {
         dev_info_opt: Option<MMIODeviceInfo>,
     ) -> Result<()> {
         // Create and attach a new RTC device.
-        // We allocate an IRQ even though we do not need it so that
-        // we do not break snapshot compatibility.
-        let slot = dev_info_opt.unwrap_or(self.allocate_new_slot(1)?);
+        let slot = dev_info_opt.unwrap_or(self.allocate_new_slot(0)?);
 
         let identifier = (DeviceType::Rtc, DeviceType::Rtc.to_string());
         self.register_mmio_device(identifier, slot, rtc)
@@ -710,8 +708,6 @@ mod tests {
         .unwrap();
         let mut vm = builder::setup_kvm_vm(&guest_mem, false).unwrap();
 
-        #[cfg(target_arch = "x86_64")]
-        // Only used for x86_64 part of the test.
         let mem_clone = guest_mem.clone();
 
         #[cfg(target_arch = "x86_64")]
@@ -746,27 +742,25 @@ mod tests {
             .get_device(DeviceType::Virtio(type_id), &id)
             .is_none());
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            let dummy2 = Arc::new(Mutex::new(DummyDevice::new()));
-            let id2 = String::from("foo2");
-            device_manager
-                .register_virtio_test_device(vm.fd(), mem_clone, dummy2, &mut cmdline, &id2)
-                .unwrap();
+        let dummy2 = Arc::new(Mutex::new(DummyDevice::new()));
+        let id2 = String::from("foo2");
+        device_manager
+            .register_virtio_test_device(vm.fd(), mem_clone, dummy2, &mut cmdline, &id2)
+            .unwrap();
 
-            let mut count = 0;
-            let _: Result<()> = device_manager.for_each_device(|devtype, devid, _, _| {
-                assert_eq!(*devtype, DeviceType::Virtio(type_id));
-                match devid.as_str() {
-                    "foo" => count += 1,
-                    "foo2" => count += 2,
-                    _ => unreachable!(),
-                };
-                Ok(())
-            });
-            assert_eq!(count, 3);
-            assert_eq!(device_manager.used_irqs_count(), 2);
-        }
+        let mut count = 0;
+        let _: Result<()> = device_manager.for_each_device(|devtype, devid, _, _| {
+            assert_eq!(*devtype, DeviceType::Virtio(type_id));
+            match devid.as_str() {
+                "foo" => count += 1,
+                "foo2" => count += 2,
+                _ => unreachable!(),
+            };
+            Ok(())
+        });
+        assert_eq!(count, 3);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(device_manager.used_irqs_count(), 2);
     }
 
     #[test]

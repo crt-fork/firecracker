@@ -33,9 +33,7 @@ import pytest
 from _pytest.mark import Expression, MarkMatcher
 from _pytest.main import ExitCode
 
-from . import defs  # pylint: disable=relative-beyond-top-level
-from . import mpsing  # pylint: disable=relative-beyond-top-level
-from . import report as treport  # pylint: disable=relative-beyond-top-level
+from framework import defs, mpsing, report as treport
 
 
 class PytestScheduler(mpsing.MultiprocessSingleton):
@@ -221,7 +219,6 @@ class PytestScheduler(mpsing.MultiprocessSingleton):
             PytestScheduler.filter_batch(session.config,
                                          batch,
                                          marker_name="nonci")
-            break
 
         for batch in schedule:
             self._raw_stdout(
@@ -318,7 +315,7 @@ class PytestScheduler(mpsing.MultiprocessSingleton):
         for item, nextitem in zip(
                 self.session.items,
                 self.session.items[1:] + [None]
-                ):
+        ):
             item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
 
     @mpsing.ipcmethod

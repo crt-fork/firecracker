@@ -1,7 +1,6 @@
 // Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use mmds::MAX_DATA_STORE_SIZE;
 use std::io::prelude::*;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -13,7 +12,6 @@ use std::thread;
 use api_server::{ApiRequest, ApiResponse, ApiServer};
 use event_manager::{EventOps, Events, MutEventSubscriber, SubscriberOps};
 use logger::{error, warn, ProcessTimeReporter};
-use mmds::MMDS;
 use seccompiler::BpfThreadMap;
 use utils::{epoll::EventSet, eventfd::EventFd};
 use vmm::{
@@ -117,6 +115,7 @@ impl MutEventSubscriber for ApiServerAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_api(
     seccomp_filters: &mut BpfThreadMap,
     config_json: Option<String>,
@@ -125,6 +124,7 @@ pub(crate) fn run_with_api(
     process_time_reporter: ProcessTimeReporter,
     boot_timer_enabled: bool,
     payload_limit: Option<usize>,
+    metadata_json: Option<&str>,
 ) -> ExitCode {
     // FD to notify of API events. This is a blocking eventfd by design.
     // It is used in the config/pre-boot loop which is a simple blocking loop
@@ -134,12 +134,6 @@ pub(crate) fn run_with_api(
     let (to_vmm, from_api) = channel();
     let (to_api, from_vmm) = channel();
 
-    // MMDS only supported with API.
-    let mmds_info = MMDS.clone();
-    mmds_info
-        .lock()
-        .expect("Failed to acquire lock on MMDS info")
-        .set_data_store_limit(payload_limit.unwrap_or(MAX_DATA_STORE_SIZE));
     let to_vmm_event_fd = api_event_fd
         .try_clone()
         .expect("Failed to clone API event FD");
@@ -151,7 +145,7 @@ pub(crate) fn run_with_api(
     let api_thread = thread::Builder::new()
         .name("fc_api".to_owned())
         .spawn(move || {
-            match ApiServer::new(mmds_info, to_vmm, from_vmm, to_vmm_event_fd).bind_and_run(
+            match ApiServer::new(to_vmm, from_vmm, to_vmm_event_fd).bind_and_run(
                 api_bind_path,
                 process_time_reporter,
                 &api_seccomp_filter,
@@ -188,6 +182,8 @@ pub(crate) fn run_with_api(
             json,
             instance_info,
             boot_timer_enabled,
+            payload_limit,
+            metadata_json.as_deref(),
         ),
         None => PrebootApiController::build_microvm_from_requests(
             &seccomp_filters,
@@ -210,6 +206,8 @@ pub(crate) fn run_with_api(
                     .expect("one-shot channel closed")
             },
             boot_timer_enabled,
+            payload_limit,
+            metadata_json,
         ),
     };
 

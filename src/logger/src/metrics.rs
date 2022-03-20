@@ -134,10 +134,19 @@ impl<T: Serialize> Metrics<T> {
     /// Upon success, the function will return `True` (if metrics system was initialized and metrics
     /// were successfully written to disk) or `False` (if metrics system was not yet initialized).
     ///
-    /// This function is supposed to be called only from a single thread and
+    /// This function is usually supposed to be called only from a single thread and
     /// is not meant to be used in a multithreaded scenario. The reason
     /// `metrics_buf` is enclosed in a `Mutex` is that `lazy_static` enforces
     /// thread-safety on all its members.
+    /// The only exception is for signal handlers that result in process exit, which may be run on
+    /// any thread. To prevent the race condition present in the serialisation step of
+    /// SharedIncMetrics, deadly signals use SharedStoreMetrics instead (which have a thread-safe
+    /// serialise implementation).
+    /// The only known caveat is that other metrics may not be properly written before exiting from
+    /// a signal handler. We make this compromise since the process will be killed anyway and the
+    /// important metric in this case is the signal one.
+    /// The alternative is to hold a Mutex over the entire function call, but this increases the
+    /// known deadlock potential.
     pub fn write(&self) -> Result<bool, MetricsError> {
         if self.is_initialized.load(Ordering::Relaxed) {
             match serde_json::to_string(&self.app_metrics) {
@@ -196,7 +205,7 @@ impl fmt::Display for MetricsError {
                 "Reinitialization of metrics not allowed.".to_string()
             }
             MetricsError::Serde(ref e) => e.to_string(),
-            MetricsError::Write(ref e) => format!("Failed to write metrics. Error: {}", e),
+            MetricsError::Write(ref e) => format!("Failed to write metrics: {}", e),
         };
         write!(f, "{}", printable)
     }
@@ -236,6 +245,8 @@ pub trait StoreMetric {
 #[derive(Default)]
 pub struct SharedIncMetric(AtomicUsize, AtomicUsize);
 
+/// Representation of a metric that is expected to hold a value that can be accessed
+/// from more than one thread, so more synchronization is necessary.
 #[derive(Default)]
 pub struct SharedStoreMetric(AtomicUsize);
 
@@ -297,6 +308,7 @@ pub struct ProcessTimeReporter {
 }
 
 impl ProcessTimeReporter {
+    /// Constructor for the process time-related reporter.
     pub fn new(
         start_time_us: Option<u64>,
         start_time_cpu_us: Option<u64>,
@@ -309,6 +321,7 @@ impl ProcessTimeReporter {
         }
     }
 
+    /// Obtain process start time in microseconds.
     pub fn report_start_time(&self) {
         if let Some(start_time) = self.start_time_us {
             let delta_us = utils::time::get_time_us(utils::time::ClockType::Monotonic) - start_time;
@@ -319,6 +332,7 @@ impl ProcessTimeReporter {
         }
     }
 
+    /// Obtain process CPU start time in microseconds.
     pub fn report_cpu_start_time(&self) {
         if let Some(cpu_start_time) = self.start_time_cpu_us {
             let delta_us = utils::time::get_time_us(utils::time::ClockType::ProcessCpu)
@@ -358,6 +372,8 @@ pub struct GetRequestsMetrics {
     pub machine_cfg_count: SharedIncMetric,
     /// Number of GETs for getting mmds.
     pub mmds_count: SharedIncMetric,
+    /// Number of GETs for getting the VMM version.
+    pub vmm_version_count: SharedIncMetric,
 }
 
 /// Metrics specific to PUT API Requests for counting user triggered actions and/or failures.
@@ -395,6 +411,10 @@ pub struct PutRequestsMetrics {
     pub mmds_count: SharedIncMetric,
     /// Number of failures in creating a new mmds.
     pub mmds_fails: SharedIncMetric,
+    /// Number of PUTs for creating a vsock device.
+    pub vsock_count: SharedIncMetric,
+    /// Number of failures in creating a vsock device.
+    pub vsock_fails: SharedIncMetric,
 }
 
 /// Metrics specific to PATCH API Requests for counting user triggered actions and/or failures.
@@ -416,6 +436,15 @@ pub struct PatchRequestsMetrics {
     pub mmds_count: SharedIncMetric,
     /// Number of failures in PATCHing an mmds.
     pub mmds_fails: SharedIncMetric,
+}
+
+/// Metrics related to deprecated user-facing API calls.
+#[derive(Default, Serialize)]
+pub struct DeprecatedApiMetrics {
+    /// Total number of calls to deprecated HTTP endpoints.
+    pub deprecated_http_api_calls: SharedIncMetric,
+    /// Total number of calls to deprecated CMD line parameters.
+    pub deprecated_cmd_line_api_calls: SharedIncMetric,
 }
 
 /// Balloon Device associated metrics.
@@ -470,6 +499,9 @@ pub struct BlockDeviceMetrics {
     pub write_count: SharedIncMetric,
     /// Number of rate limiter throttling events.
     pub rate_limiter_throttled_events: SharedIncMetric,
+    /// Number of virtio events throttled because of the IO engine.
+    /// This happens when the io_uring submission queue is full.
+    pub io_engine_throttled_events: SharedIncMetric,
 }
 
 /// Metrics specific to the i8042 device.
@@ -651,7 +683,7 @@ impl RtcEvents for RTCDeviceMetrics {
 #[derive(Default, Serialize)]
 pub struct SeccompMetrics {
     /// Number of errors inside the seccomp filtering.
-    pub num_faults: SharedIncMetric,
+    pub num_faults: SharedStoreMetric,
 }
 
 /// Metrics specific to the UART device.
@@ -672,22 +704,25 @@ pub struct SerialDeviceMetrics {
 }
 
 /// Metrics related to signals.
+/// Deadly signals must be of `SharedStoreMetric` type, since they can ever be either 0 or 1.
+/// This avoids a tricky race condition caused by the unatomic serialize method of
+/// `SharedIncMetric`, between two threads calling `METRICS.write()`.
 #[derive(Default, Serialize)]
 pub struct SignalMetrics {
     /// Number of times that SIGBUS was handled.
-    pub sigbus: SharedIncMetric,
+    pub sigbus: SharedStoreMetric,
     /// Number of times that SIGSEGV was handled.
-    pub sigsegv: SharedIncMetric,
+    pub sigsegv: SharedStoreMetric,
     /// Number of times that SIGXFSZ was handled.
-    pub sigxfsz: SharedIncMetric,
+    pub sigxfsz: SharedStoreMetric,
     /// Number of times that SIGXCPU was handled.
-    pub sigxcpu: SharedIncMetric,
+    pub sigxcpu: SharedStoreMetric,
     /// Number of times that SIGPIPE was handled.
     pub sigpipe: SharedIncMetric,
     /// Number of times that SIGHUP was handled.
-    pub sighup: SharedIncMetric,
+    pub sighup: SharedStoreMetric,
     /// Number of times that SIGILL was handled.
-    pub sigill: SharedIncMetric,
+    pub sigill: SharedStoreMetric,
 }
 
 /// Metrics specific to VCPUs' mode of functioning.
@@ -713,7 +748,7 @@ pub struct VmmMetrics {
     /// Number of device related events received for a VM.
     pub device_events: SharedIncMetric,
     /// Metric for signaling a panic has occurred.
-    pub panic_count: SharedIncMetric,
+    pub panic_count: SharedStoreMetric,
 }
 
 /// Vsock-related metrics.
@@ -783,6 +818,8 @@ pub struct FirecrackerMetrics {
     pub balloon: BalloonDeviceMetrics,
     /// A block device's related metrics.
     pub block: BlockDeviceMetrics,
+    /// Metrics related to deprecated API calls.
+    pub deprecated_api: DeprecatedApiMetrics,
     /// Metrics related to API GET requests.
     pub get_api_requests: GetRequestsMetrics,
     /// Metrics related to the i8042 device.
@@ -912,7 +949,7 @@ mod tests {
                 "{}",
                 MetricsError::Write(std::io::Error::new(ErrorKind::Interrupted, "write"))
             ),
-            "Failed to write metrics. Error: write"
+            "Failed to write metrics: write"
         );
         assert_eq!(
             format!(

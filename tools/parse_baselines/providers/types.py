@@ -22,7 +22,7 @@ class FileDataProvider(Iterator):
 
     def __init__(self, file_path: str):
         """Construct the file based data provider."""
-        self._file = open(file_path, "r")
+        self._file = open(file_path, "r", encoding='utf-8')
 
     def __iter__(self) -> 'FileDataProvider':
         """Return the iterator object (self)."""
@@ -30,7 +30,12 @@ class FileDataProvider(Iterator):
 
     def __next__(self) -> AnyStr:
         """Get a line of data from the file."""
-        return self._file.readline()
+        buffer = ""
+        for line in self._file:
+            buffer += line
+            if line == "}\n":
+                return buffer
+        return None
 
 
 class DataParser(ABC):
@@ -49,7 +54,7 @@ class DataParser(ABC):
 
     def _format_baselines(self) -> List[dict]:
         """Return the computed baselines into the right serializable format."""
-        baselines = dict()
+        baselines = {}
 
         for cpu_model in self._data:
             baselines[cpu_model] = {
@@ -89,7 +94,6 @@ class DataParser(ABC):
             json_line = json.loads(line.strip())
             measurements = json_line['results']
             cpu_model = json_line['custom']['cpu_model_name']
-
             # Consume the data and aggregate into lists.
             for tag in measurements.keys():
                 for key in self._baselines_defs:

@@ -31,6 +31,7 @@ pub enum Error {
     CgroupHierarchyMissing(String),
     CgroupControllerUnavailable(String),
     CgroupInvalidVersion(String),
+    CgroupInvalidParentPath(),
     ChangeFileOwner(PathBuf, io::Error),
     ChdirNewRoot(io::Error),
     Chmod(PathBuf, io::Error),
@@ -55,7 +56,6 @@ pub enum Error {
     MountPropagationSlave(io::Error),
     NotAFile(PathBuf),
     NotADirectory(PathBuf),
-    NumaNode(String),
     OpenDevNull(io::Error),
     OsStringParsing(PathBuf, OsString),
     PivotRoot(io::Error),
@@ -117,6 +117,12 @@ impl fmt::Display for Error {
             CgroupControllerUnavailable(ref arg) => write!(f, "Controller {} is unavailable", arg,),
             CgroupInvalidVersion(ref arg) => {
                 write!(f, "{} is an invalid cgroup version specifier", arg,)
+            }
+            CgroupInvalidParentPath() => {
+                write!(
+                    f,
+                    "Parent cgroup path is invalid. Path should not be absolute or contain '..' or '.'",
+                )
             }
             ChangeFileOwner(ref path, ref err) => {
                 write!(f, "Failed to change owner for {:?}: {}", path, err)
@@ -185,7 +191,6 @@ impl fmt::Display for Error {
                 "{}",
                 format!("{:?} is not a directory", path).replace("\"", "")
             ),
-            NumaNode(ref node) => write!(f, "Invalid numa node: {}", node),
             OpenDevNull(ref err) => write!(f, "Failed to open /dev/null: {}", err),
             OsStringParsing(ref path, _) => write!(
                 f,
@@ -255,12 +260,6 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .help("File path to exec into."),
         )
         .arg(
-            Argument::new("node")
-                .required(false)
-                .takes_value(true)
-                .help("NUMA node to assign this microVM to."),
-        )
-        .arg(
             Argument::new("uid")
                 .required(true)
                 .takes_value(true)
@@ -311,6 +310,11 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .takes_value(true)
                 .default_value("1")
                 .help("Select the cgroup version used by the jailer."),
+        )
+        .arg(
+            Argument::new("parent-cgroup")
+                .takes_value(true)
+                .help("Parent cgroup in which the cgroup of this microvm will be placed."),
         )
         .arg(
             Argument::new("version")
@@ -673,10 +677,6 @@ mod tests {
         assert_eq!(
             format!("{}", Error::NotADirectory(file_path.clone())),
             "/foo/bar is not a directory",
-        );
-        assert_eq!(
-            format!("{}", Error::NumaNode(id.to_string())),
-            "Invalid numa node: foobar",
         );
         assert_eq!(
             format!("{}", Error::OpenDevNull(io::Error::from_raw_os_error(42))),

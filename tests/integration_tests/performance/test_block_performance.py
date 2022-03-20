@@ -1,6 +1,7 @@
 # Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Performance benchmark for block device emulation."""
+
 import concurrent
 import json
 import logging
@@ -16,25 +17,28 @@ from framework.matrix import TestContext, TestMatrix
 from framework.stats import core
 from framework.stats.baseline import Provider as BaselineProvider
 from framework.stats.metadata import DictProvider as DictMetadataProvider
-from framework.utils import get_cpu_percent, CmdBuilder, DictQuery, run_cmd
-from framework.utils_cpuid import get_cpu_model_name
+from framework.utils import get_cpu_percent, get_kernel_version, \
+    is_io_uring_supported, CmdBuilder, DictQuery, run_cmd
+from framework.utils_cpuid import get_cpu_model_name, get_instance_type
 import host_tools.drive as drive_tools
 import host_tools.network as net_tools  # pylint: disable=import-error
 import framework.stats as st
 from integration_tests.performance.configs import defs
-from integration_tests.performance.utils import handle_failure, \
-    dump_test_result
+from integration_tests.performance.utils import handle_failure
+
+TEST_ID = "block_performance"
+kernel_version = get_kernel_version(level=1)
+CONFIG_NAME_REL = "test_{}_config_{}.json".format(TEST_ID, kernel_version)
+CONFIG_NAME_ABS = os.path.join(defs.CFG_LOCATION, CONFIG_NAME_REL)
+CONFIG = json.load(open(CONFIG_NAME_ABS, encoding='utf-8'))
 
 DEBUG = False
-TEST_ID = "block_device_performance"
 FIO = "fio"
 
 # Measurements tags.
 CPU_UTILIZATION_VMM = "cpu_utilization_vmm"
 CPU_UTILIZATION_VMM_SAMPLES_TAG = "cpu_utilization_vmm_samples"
 CPU_UTILIZATION_VCPUS_TOTAL = "cpu_utilization_vcpus_total"
-CONFIG = json.load(open(defs.CFG_LOCATION /
-                        "block_performance_test_config.json"))
 
 
 # pylint: disable=R0903
@@ -46,9 +50,9 @@ class BlockBaselinesProvider(BaselineProvider):
         cpu_model_name = get_cpu_model_name()
         baselines = list(filter(
             lambda cpu_baseline: cpu_baseline["model"] == cpu_model_name,
-            CONFIG["hosts"]["instances"]["m5d.metal"]["cpus"]))
+            CONFIG["hosts"]["instances"][get_instance_type()]["cpus"]))
 
-        super().__init__(DictQuery(dict()))
+        super().__init__(DictQuery({}))
         if len(baselines) > 0:
             super().__init__(DictQuery(baselines[0]))
 
@@ -132,7 +136,7 @@ def run_fio(env_id, basevm, ssh_conn, mode, bs):
         rc, _, stderr = ssh_conn.execute_command("rm *.log")
         assert rc == 0, stderr.read()
 
-        result = dict()
+        result = {}
         cpu_load = cpu_load_future.result()
         tag = "firecracker"
         assert tag in cpu_load and len(cpu_load[tag]) == 1
@@ -192,12 +196,12 @@ def read_values(cons, numjobs, env_id, mode, bs, measurement, logs_path):
     The log file format documentation can be found here:
     https://fio.readthedocs.io/en/latest/fio_doc.html#log-file-formats
     """
-    values = dict()
+    values = {}
 
     for job_id in range(numjobs):
         file_path = f"{logs_path}/{env_id}/{mode}{bs}/{mode}" \
             f"{bs}_{measurement}.{job_id + 1}.log"
-        file = open(file_path)
+        file = open(file_path, encoding='utf-8')
         lines = file.readlines()
 
         direction_count = 1
@@ -212,19 +216,19 @@ def read_values(cons, numjobs, env_id, mode, bs, measurement, logs_path):
 
                 measurement_id = f"{measurement}_{str(data_dir)}"
                 if measurement_id not in values:
-                    values[measurement_id] = dict()
+                    values[measurement_id] = {}
 
                 if value_idx not in values[measurement_id]:
-                    values[measurement_id][value_idx] = list()
+                    values[measurement_id][value_idx] = []
                 values[measurement_id][value_idx].append(int(data[1].strip()))
 
-    for measurement_id in values:
-        for idx in values[measurement_id]:
+    for (measurement_id, value_indexes) in values.items():
+        for idx in value_indexes:
             # Discard data points which were not measured by all jobs.
-            if len(values[measurement_id][idx]) != numjobs:
+            if len(value_indexes[idx]) != numjobs:
                 continue
 
-            value = sum(values[measurement_id][idx])
+            value = sum(value_indexes[idx])
             if DEBUG:
                 cons.consume_custom(measurement_id, value)
             cons.consume_data(measurement_id, value)
@@ -246,18 +250,31 @@ def consume_fio_output(cons, result, numjobs, mode, bs, env_id, logs_path):
 
 @pytest.mark.nonci
 @pytest.mark.timeout(CONFIG["time"] * 1000)  # 1.40 hours
-def test_block_performance(bin_cloner_path, results_file_dumper):
+@pytest.mark.parametrize(
+    'results_file_dumper',
+    [CONFIG_NAME_ABS],
+    indirect=True
+)
+def test_block_performance_async(bin_cloner_path, results_file_dumper):
     """
     Test block performance for multiple vm configurations.
 
     @type: performance
     """
     logger = logging.getLogger(TEST_ID)
+
+    if not is_io_uring_supported():
+        logger.info("io_uring is not supported. Skipping..")
+        pytest.skip('Cannot run async if io_uring is not supported')
+
     artifacts = ArtifactCollection(_test_images_s3_bucket())
-    microvm_artifacts = ArtifactSet(artifacts.microvms(keyword="2vcpu_1024mb"))
-    microvm_artifacts.insert(artifacts.microvms(keyword="1vcpu_1024mb"))
+    vm_artifacts = ArtifactSet(artifacts.microvms(keyword="1vcpu_1024mb"))
+    vm_artifacts.insert(artifacts.microvms(keyword="2vcpu_1024mb"))
+
     kernel_artifacts = ArtifactSet(artifacts.kernels())
     disk_artifacts = ArtifactSet(artifacts.disks(keyword="ubuntu"))
+
+    logger.info("Testing on processor %s", get_cpu_model_name())
 
     # Create a test context and add builder, logger, network.
     test_context = TestContext()
@@ -265,12 +282,56 @@ def test_block_performance(bin_cloner_path, results_file_dumper):
         'builder': MicrovmBuilder(bin_cloner_path),
         'logger': logger,
         'name': TEST_ID,
-        'results_file_dumper': results_file_dumper
+        'results_file_dumper': results_file_dumper,
+        'io_engine': 'Async'
     }
 
     test_matrix = TestMatrix(context=test_context,
                              artifact_sets=[
-                                 microvm_artifacts,
+                                 vm_artifacts,
+                                 kernel_artifacts,
+                                 disk_artifacts
+                             ])
+    test_matrix.run_test(fio_workload)
+
+
+@pytest.mark.nonci
+@pytest.mark.timeout(CONFIG["time"] * 1000)  # 1.40 hours
+@pytest.mark.parametrize(
+    'results_file_dumper',
+    [CONFIG_NAME_ABS],
+    indirect=True
+)
+def test_block_performance_sync(bin_cloner_path, results_file_dumper):
+    """
+    Test block performance for multiple vm configurations.
+
+    @type: performance
+    """
+    logger = logging.getLogger(TEST_ID)
+
+    artifacts = ArtifactCollection(_test_images_s3_bucket())
+    vm_artifacts = ArtifactSet(artifacts.microvms(keyword="1vcpu_1024mb"))
+    vm_artifacts.insert(artifacts.microvms(keyword="2vcpu_1024mb"))
+
+    kernel_artifacts = ArtifactSet(artifacts.kernels())
+    disk_artifacts = ArtifactSet(artifacts.disks(keyword="ubuntu"))
+
+    logger.info("Testing on processor %s", get_cpu_model_name())
+
+    # Create a test context and add builder, logger, network.
+    test_context = TestContext()
+    test_context.custom = {
+        'builder': MicrovmBuilder(bin_cloner_path),
+        'logger': logger,
+        'name': TEST_ID,
+        'results_file_dumper': results_file_dumper,
+        'io_engine': 'Sync'
+    }
+
+    test_matrix = TestMatrix(context=test_context,
+                             artifact_sets=[
+                                 vm_artifacts,
                                  kernel_artifacts,
                                  disk_artifacts
                              ])
@@ -282,6 +343,7 @@ def fio_workload(context):
     vm_builder = context.custom['builder']
     logger = context.custom["logger"]
     file_dumper = context.custom["results_file_dumper"]
+    io_engine = context.custom["io_engine"]
 
     # Create a rw copy artifact.
     rw_disk = context.disk.copy()
@@ -299,7 +361,8 @@ def fio_workload(context):
         os.path.join(basevm.fsfiles, 'scratch'),
         CONFIG["block_device_size"]
     )
-    basevm.add_drive('scratch', fs.path)
+    basevm.add_drive('scratch', fs.path,
+                     io_engine=io_engine)
     basevm.start()
 
     # Get names of threads in Firecracker.
@@ -325,7 +388,7 @@ def fio_workload(context):
 
     ssh_connection = net_tools.SSHConnection(basevm.ssh_config)
     env_id = f"{context.kernel.name()}/{context.disk.name()}/" \
-             f"{context.microvm.name()}"
+             f"{io_engine.lower()}_{context.microvm.name()}"
 
     for mode in CONFIG["fio_modes"]:
         for bs in CONFIG["fio_blk_sizes"]:
@@ -352,4 +415,4 @@ def fio_workload(context):
     except core.CoreException as err:
         handle_failure(file_dumper, err)
 
-    dump_test_result(file_dumper, result)
+    file_dumper.dump(result)

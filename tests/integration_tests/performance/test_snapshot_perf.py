@@ -12,11 +12,11 @@ from framework.defs import DEFAULT_TEST_IMAGES_S3_BUCKET
 from framework.matrix import TestMatrix, TestContext
 from framework.builder import MicrovmBuilder, SnapshotBuilder, SnapshotType
 from framework.utils import eager_map, CpuMap, \
-    get_firecracker_version_from_toml
+    get_firecracker_version_from_toml, compare_versions, get_kernel_version, \
+    is_io_uring_supported
 from framework.stats import core, consumer, producer, types, criteria,\
     function
-from integration_tests.performance.utils import handle_failure, \
-    dump_test_result
+from integration_tests.performance.utils import handle_failure
 
 import host_tools.network as net_tools  # pylint: disable=import-error
 import host_tools.logging as log_tools
@@ -114,16 +114,23 @@ def snapshot_create_measurements(vm_type, snapshot_type):
 
 def snapshot_resume_measurements(vm_type):
     """Define measurements for snapshot resume tests."""
+    load_latency = LOAD_LATENCY_BASELINES[platform.machine()][vm_type]
+
+    if is_io_uring_supported():
+        # There is added latency caused by the io_uring syscalls used by the
+        # block device.
+        load_latency["target"] += 115
+    if compare_versions(get_kernel_version(), "5.4.0") > 0:
+        # Host kernels >= 5.4 add an up to ~30ms latency.
+        # See: https://github.com/firecracker-microvm/firecracker/issues/2129
+        load_latency["target"] += 30
+
     latency = types.MeasurementDef.create_measurement(
         "latency",
         "ms",
         [function.Max("max")],
         {
-            "max": criteria.LowerThan(
-                LOAD_LATENCY_BASELINES
-                [platform.machine()]
-                [vm_type]
-            )
+            "max": criteria.LowerThan(load_latency)
         })
 
     return [latency]
@@ -207,8 +214,8 @@ def _test_snapshot_create_latency(context):
                 .format(DEFAULT_TEST_IMAGES_S3_BUCKET))
     artifacts = ArtifactCollection(_test_images_s3_bucket())
     firecracker_versions = artifacts.firecracker_versions(
-        # v0.26.0 breaks snapshot compatibility with older versions.
-        min_version="0.26.0",
+        # v1.0.0 breaks snapshot compatibility with older versions.
+        min_version="1.0.0",
         max_version=get_firecracker_version_from_toml())
     assert len(firecracker_versions) > 0
 
@@ -296,7 +303,7 @@ def _test_snapshot_create_latency(context):
     except core.CoreException as err:
         handle_failure(file_dumper, err)
 
-    dump_test_result(file_dumper, result)
+    file_dumper.dump(result)
 
 
 def _test_snapshot_resume_latency(context):
@@ -375,7 +382,7 @@ def _test_snapshot_resume_latency(context):
     except core.CoreException as err:
         handle_failure(file_dumper, err)
 
-    dump_test_result(file_dumper, result)
+    file_dumper.dump(result)
 
 
 def _test_older_snapshot_resume_latency(context):
@@ -449,7 +456,7 @@ def _test_older_snapshot_resume_latency(context):
     except core.CoreException as err:
         handle_failure(file_dumper, err)
 
-    dump_test_result(file_dumper, result)
+    file_dumper.dump(result)
 
 
 def test_snapshot_create_full_latency(network_config,
@@ -469,7 +476,7 @@ def test_snapshot_create_full_latency(network_config,
     # TODO: Multiple microvm sizes must be tested in the async pipeline.
     microvm_artifacts = ArtifactSet(artifacts.microvms(keyword="2vcpu_512mb"))
     microvm_artifacts.insert(artifacts.microvms(keyword="2vcpu_256mb"))
-    kernel_artifacts = ArtifactSet(artifacts.kernels(keyword="4.14"))
+    kernel_artifacts = ArtifactSet(artifacts.kernels())
     disk_artifacts = ArtifactSet(artifacts.disks(keyword="ubuntu"))
 
     # Create a test context and add builder, logger, network.
@@ -505,13 +512,13 @@ def test_snapshot_create_diff_latency(network_config,
     logger = logging.getLogger("snapshot_sequence")
     artifacts = ArtifactCollection(_test_images_s3_bucket())
     # Testing matrix:
-    # - Guest kernel: Linux 4.14
+    # - Guest kernel: All supported ones
     # - Rootfs: Ubuntu 18.04
     # - Microvm: 2vCPU with 256/512 MB RAM
     # TODO: Multiple microvm sizes must be tested in the async pipeline.
     microvm_artifacts = ArtifactSet(artifacts.microvms(keyword="2vcpu_512mb"))
     microvm_artifacts.insert(artifacts.microvms(keyword="2vcpu_256mb"))
-    kernel_artifacts = ArtifactSet(artifacts.kernels(keyword="4.14"))
+    kernel_artifacts = ArtifactSet(artifacts.kernels())
     disk_artifacts = ArtifactSet(artifacts.disks(keyword="ubuntu"))
 
     # Create a test context and add builder, logger, network.
@@ -548,14 +555,14 @@ def test_snapshot_resume_latency(network_config,
 
     artifacts = ArtifactCollection(_test_images_s3_bucket())
     # Testing matrix:
-    # - Guest kernel: Linux 4.14
+    # - Guest kernel: All supported ones
     # - Rootfs: Ubuntu 18.04
     # - Microvm: 2vCPU with 256/512 MB RAM
     # TODO: Multiple microvm sizes must be tested in the async pipeline.
     microvm_artifacts = ArtifactSet(artifacts.microvms(keyword="2vcpu_512mb"))
     microvm_artifacts.insert(artifacts.microvms(keyword="2vcpu_256mb"))
 
-    kernel_artifacts = ArtifactSet(artifacts.kernels(keyword="4.14"))
+    kernel_artifacts = ArtifactSet(artifacts.kernels())
     disk_artifacts = ArtifactSet(artifacts.disks(keyword="ubuntu"))
 
     # Create a test context and add builder, logger, network.

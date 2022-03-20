@@ -3,7 +3,6 @@
 
 //! Provides functionality for saving/restoring the MMIO device manager and its devices.
 
-use std::io;
 use std::result::Result;
 use std::sync::{Arc, Mutex};
 
@@ -11,12 +10,13 @@ use super::mmio::*;
 use crate::EventManager;
 use logger::error;
 
+use crate::resources::VmResources;
 #[cfg(target_arch = "aarch64")]
 use arch::DeviceType;
 use devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
 use devices::virtio::balloon::{Balloon, Error as BalloonError};
 use devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
-use devices::virtio::block::Block;
+use devices::virtio::block::{Block, Error as BlockError};
 use devices::virtio::net::persist::{Error as NetError, NetConstructorArgs, NetState};
 use devices::virtio::net::Net;
 use devices::virtio::persist::{MmioTransportConstructorArgs, MmioTransportState};
@@ -36,7 +36,7 @@ use vm_memory::GuestMemoryMmap;
 #[derive(Debug)]
 pub enum Error {
     Balloon(BalloonError),
-    Block(io::Error),
+    Block(BlockError),
     DeviceManager(super::mmio::Error),
     MmioTransport,
     #[cfg(target_arch = "aarch64")]
@@ -130,6 +130,15 @@ pub struct DeviceStates {
     pub balloon_device: Option<ConnectedBalloonState>,
 }
 
+/// A type used to extract the concrete Arc<Mutex<T>> for each of the device types when restoring
+/// from a snapshot.
+pub enum SharedDeviceType {
+    SharedBlock(Arc<Mutex<Block>>),
+    SharedNetwork(Arc<Mutex<Net>>),
+    SharedBalloon(Arc<Mutex<Balloon>>),
+    SharedVsock(Arc<Mutex<Vsock<VsockUnixBackend>>>),
+}
+
 impl DeviceStates {
     fn balloon_serialize(&mut self, target_version: u16) -> VersionizeResult<()> {
         if target_version < 2 && self.balloon_device.is_some() {
@@ -146,6 +155,8 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub mem: GuestMemoryMmap,
     pub vm: &'a VmFd,
     pub event_manager: &'a mut EventManager,
+    pub for_each_restored_device: fn(&mut VmResources, SharedDeviceType),
+    pub vm_resources: &'a mut VmResources,
 }
 
 impl<'a> Persist<'a> for MMIODeviceManager {
@@ -204,14 +215,11 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     });
                 }
                 TYPE_BLOCK => {
-                    let block_state = locked_device
-                        .as_any()
-                        .downcast_ref::<Block>()
-                        .unwrap()
-                        .save();
+                    let block = locked_device.as_mut_any().downcast_mut::<Block>().unwrap();
+                    block.prepare_save();
                     states.block_devices.push(ConnectedBlockState {
                         device_id: devid.clone(),
-                        device_state: block_state,
+                        device_state: block.save(),
                         transport_state,
                         mmio_slot: devinfo.clone(),
                     });
@@ -276,7 +284,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                     let serial = crate::builder::setup_serial_device(
                         constructor_args.event_manager,
                         Box::new(crate::builder::SerialStdin::get()),
-                        Box::new(io::stdout()),
+                        Box::new(std::io::stdout()),
                     )
                     .map_err(Error::Legacy)?;
 
@@ -327,6 +335,11 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 .map_err(Error::Balloon)?,
             ));
 
+            (constructor_args.for_each_restored_device)(
+                constructor_args.vm_resources,
+                SharedDeviceType::SharedBalloon(device.clone()),
+            );
+
             restore_helper(
                 device.clone(),
                 device,
@@ -346,6 +359,11 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 .map_err(Error::Block)?,
             ));
 
+            (constructor_args.for_each_restored_device)(
+                constructor_args.vm_resources,
+                SharedDeviceType::SharedBlock(device.clone()),
+            );
+
             restore_helper(
                 device.clone(),
                 device,
@@ -355,14 +373,23 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 constructor_args.event_manager,
             )?;
         }
+
         for net_state in &state.net_devices {
             let device = Arc::new(Mutex::new(
                 Net::restore(
-                    NetConstructorArgs { mem: mem.clone() },
+                    NetConstructorArgs {
+                        mem: mem.clone(),
+                        mmds: constructor_args.vm_resources.mmds.clone(),
+                    },
                     &net_state.device_state,
                 )
                 .map_err(Error::Net)?,
             ));
+
+            (constructor_args.for_each_restored_device)(
+                constructor_args.vm_resources,
+                SharedDeviceType::SharedNetwork(device.clone()),
+            );
 
             restore_helper(
                 device.clone(),
@@ -373,6 +400,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 constructor_args.event_manager,
             )?;
         }
+
         if let Some(vsock_state) = &state.vsock_device {
             let ctor_args = VsockUdsConstructorArgs {
                 cid: vsock_state.device_state.frontend.cid,
@@ -389,6 +417,11 @@ impl<'a> Persist<'a> for MMIODeviceManager {
                 )
                 .map_err(Error::Vsock)?,
             ));
+
+            (constructor_args.for_each_restored_device)(
+                constructor_args.vm_resources,
+                SharedDeviceType::SharedVsock(device.clone()),
+            );
 
             restore_helper(
                 device.clone(),
@@ -408,6 +441,7 @@ impl<'a> Persist<'a> for MMIODeviceManager {
 mod tests {
     use super::*;
     use crate::builder::tests::*;
+    use crate::resources::VmmConfig;
     use crate::vmm_config::balloon::BalloonDeviceConfig;
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::vsock::VsockDeviceConfig;
@@ -573,7 +607,6 @@ mod tests {
                 guest_mac: None,
                 rx_rate_limiter: None,
                 tx_rate_limiter: None,
-                allow_mmds_requests: true,
             };
             insert_net_device(
                 &mut vmm,
@@ -584,7 +617,7 @@ mod tests {
             // Add a vsock device.
             let vsock_dev_id = "vsock";
             let vsock_config = VsockDeviceConfig {
-                vsock_id: vsock_dev_id.to_string(),
+                vsock_id: Some(vsock_dev_id.to_string()),
                 guest_cid: 3,
                 uds_path: tmp_sock_file.as_path().to_str().unwrap().to_string(),
             };
@@ -616,14 +649,77 @@ mod tests {
         let vmm = default_vmm();
         let device_states: DeviceStates =
             DeviceStates::deserialize(&mut buf.as_slice(), &version_map, 2).unwrap();
+        let vm_resources = &mut VmResources::default();
         let restore_args = MMIODevManagerConstructorArgs {
             mem: vmm.guest_memory().clone(),
             vm: vmm.vm.fd(),
             event_manager: &mut event_manager,
+            for_each_restored_device: VmResources::update_from_restored_device,
+            vm_resources,
         };
         let restored_dev_manager =
             MMIODeviceManager::restore(restore_args, &device_states).unwrap();
 
+        let expected_vm_resources = format!(
+            r#"{{
+  "balloon": {{
+    "amount_mib": 123,
+    "deflate_on_oom": false,
+    "stats_polling_interval_s": 1
+  }},
+  "drives": [
+    {{
+      "drive_id": "root",
+      "path_on_host": "{}",
+      "is_root_device": true,
+      "partuuid": null,
+      "is_read_only": true,
+      "cache_type": "Unsafe",
+      "rate_limiter": null,
+      "io_engine": "Sync"
+    }}
+  ],
+  "boot-source": {{
+    "kernel_image_path": "",
+    "initrd_path": null
+  }},
+  "logger": null,
+  "machine-config": {{
+    "vcpu_count": 1,
+    "mem_size_mib": 128,
+    "smt": false,
+    "track_dirty_pages": false
+  }},
+  "metrics": null,
+  "mmds-config": null,
+  "network-interfaces": [
+    {{
+      "iface_id": "netif",
+      "host_dev_name": "hostname",
+      "guest_mac": "00:00:00:00:00:00",
+      "rx_rate_limiter": null,
+      "tx_rate_limiter": null
+    }}
+  ],
+  "vsock": {{
+    "guest_cid": 3,
+    "uds_path": "{}"
+  }}
+}}"#,
+            _block_files
+                .last()
+                .unwrap()
+                .as_path()
+                .to_str()
+                .unwrap()
+                .to_string(),
+            tmp_sock_file.as_path().to_str().unwrap().to_string()
+        );
+
         assert_eq!(restored_dev_manager, original_mmio_device_manager);
+        assert_eq!(
+            expected_vm_resources,
+            serde_json::to_string_pretty(&VmmConfig::from(&*vm_resources)).unwrap()
+        );
     }
 }

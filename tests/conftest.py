@@ -81,14 +81,15 @@ import shutil
 import sys
 import tempfile
 import uuid
+import json
 
 import pytest
 
 import host_tools.cargo_build as build_tools
 import host_tools.network as net_tools
-import host_tools.proc as proc
-import framework.utils as utils
-import framework.defs as defs
+from host_tools import proc
+from framework import utils
+from framework import defs
 from framework.artifacts import ArtifactCollection
 from framework.microvm import Microvm
 from framework.s3fetcher import MicrovmImageS3Fetcher
@@ -107,9 +108,14 @@ if os.geteuid() != 0:
     raise PermissionError("Test session needs to be run as root.")
 
 
-# Style related tests are run only on AMD.
-if "AMD" not in proc.proc_type():
-    collect_ignore = [os.path.join(SCRIPT_FOLDER, "integration_tests/style")]
+# Style related tests and dependency enforcements are run only on Intel.
+if "Intel" not in proc.proc_type():
+    TEST_DIR = "integration_tests"
+    collect_ignore = [
+        os.path.join(SCRIPT_FOLDER, "{}/style".format(TEST_DIR)),
+        os.path.join(SCRIPT_FOLDER,
+                     "{}/build/test_dependencies.py".format(TEST_DIR))
+    ]
 
 
 def _test_images_s3_bucket():
@@ -124,28 +130,50 @@ ARTIFACTS_COLLECTION = ArtifactCollection(_test_images_s3_bucket())
 MICROVM_S3_FETCHER = MicrovmImageS3Fetcher(_test_images_s3_bucket())
 
 
-class ResultsFileDumper:  # pylint: disable=too-few-public-methods
+# pylint: disable=too-few-public-methods
+class ResultsDumperInterface:
+    """Interface for dumping results to file."""
+
+    def dump(self, result):
+        """Dump the results in JSON format."""
+
+
+# pylint: disable=too-few-public-methods
+class NopResultsDumper(ResultsDumperInterface):
+    """Interface for dummy dumping results to file."""
+
+    def dump(self, result):
+        """Do not do anything."""
+
+
+# pylint: disable=too-few-public-methods
+class JsonFileDumper(ResultsDumperInterface):
     """Class responsible with outputting test results to files."""
 
-    def __init__(self, test_name: str, append=True):
+    def __init__(self, request):
         """Initialize the instance."""
-        if not append:
-            flags = "w"
-        else:
-            flags = "a"
+        self._results_file = None
 
+        test_name = request.node.originalname
         self._root_path = defs.TEST_RESULTS_DIR
-
         # Create the root directory, if it doesn't exist.
         self._root_path.mkdir(exist_ok=True)
+        self._results_file = os.path.join(
+            self._root_path, "{}_results_{}.json".format(
+                test_name, utils.get_kernel_version(level=1)))
 
-        self._file = open(self._root_path / test_name, flags)
+    @staticmethod
+    def __dump_pretty_json(file, data, flags):
+        """Write the `data` dictionary to the output file in pretty format."""
+        with open(file, flags, encoding='utf-8') as file_fd:
+            json.dump(data, file_fd, indent=4)
+            file_fd.write("\n")  # Add newline cause Py JSON does not
+            file_fd.flush()
 
-    def writeln(self, data: str):
-        """Write the `data` string to the output file, appending a newline."""
-        self._file.write(data)
-        self._file.write("\n")
-        self._file.flush()
+    def dump(self, result):
+        """Dump the results in JSON format."""
+        if self._results_file:
+            self.__dump_pretty_json(self._results_file, result, "a")
 
 
 def init_microvm(root_path, bin_cloner_path,
@@ -240,9 +268,9 @@ def test_session_tmp_path(test_fc_session_root_path):
 def results_file_dumper(request):
     """Yield the custom --dump-results-to-file test flag."""
     if request.config.getoption("--dump-results-to-file"):
-        return ResultsFileDumper(request.node.originalname)
+        return JsonFileDumper(request)
 
-    return None
+    return NopResultsDumper()
 
 
 def _gcc_compile(src_file, output_file, extra_flags="-static -O3"):

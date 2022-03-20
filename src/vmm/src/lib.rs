@@ -52,6 +52,7 @@ use crate::vstate::{
     vm::Vm,
 };
 use arch::DeviceType;
+use devices::legacy::serial::{IER_RDA_BIT, IER_RDA_OFFSET};
 use devices::virtio::balloon::Error as BalloonError;
 use devices::virtio::{
     Balloon, BalloonConfig, BalloonStats, Block, MmioTransport, Net, BALLOON_DEV_ID, TYPE_BALLOON,
@@ -253,6 +254,11 @@ pub struct Vmm {
 }
 
 impl Vmm {
+    /// Gets Vmm version.
+    pub fn version(&self) -> String {
+        self.instance_info.vmm_version.clone()
+    }
+
     /// Gets Vmm instance info.
     pub fn instance_info(&self) -> InstanceInfo {
         self.instance_info.clone()
@@ -344,6 +350,44 @@ impl Vmm {
     /// Returns a reference to the inner `GuestMemoryMmap` object if present, or `None` otherwise.
     pub fn guest_memory(&self) -> &GuestMemoryMmap {
         &self.guest_memory
+    }
+
+    /// Sets RDA bit in serial console
+    pub fn emulate_serial_init(&self) -> Result<()> {
+        #[cfg(target_arch = "aarch64")]
+        use devices::legacy::SerialDevice;
+        #[cfg(target_arch = "x86_64")]
+        let mut serial = self
+            .pio_device_manager
+            .stdio_serial
+            .lock()
+            .expect("Poisoned lock");
+
+        #[cfg(target_arch = "aarch64")]
+        let serial_bus_device = self.get_bus_device(DeviceType::Serial, "Serial");
+        #[cfg(target_arch = "aarch64")]
+        if serial_bus_device.is_none() {
+            return Ok(());
+        }
+        #[cfg(target_arch = "aarch64")]
+        let mut serial_device_locked = serial_bus_device.unwrap().lock().expect("Poisoned lock");
+        #[cfg(target_arch = "aarch64")]
+        let serial = serial_device_locked
+            .as_mut_any()
+            .downcast_mut::<SerialDevice>()
+            .expect("Unexpected BusDeviceType");
+
+        // When restoring from a previously saved state, there is no serial
+        // driver initialization, therefore the RDA (Received Data Available)
+        // interrupt is not enabled. Because of that, the driver won't get
+        // notified of any bytes that we send to the guest. The clean solution
+        // would be to save the whole serial device state when we do the vm
+        // serialization. For now we set that bit manually
+        serial
+            .serial
+            .write(IER_RDA_OFFSET, IER_RDA_BIT)
+            .map_err(|_| Error::Serial(std::io::Error::last_os_error()))?;
+        Ok(())
     }
 
     /// Injects CTRL+ALT+DEL keystroke combo in the i8042 device.
@@ -515,7 +559,7 @@ impl Vmm {
             .with_virtio_device_with_id(TYPE_BLOCK, drive_id, |block: &mut Block| {
                 block
                     .update_disk_image(path_on_host)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| format!("{:?}", e))
             })
             .map_err(Error::DeviceManager)
     }
@@ -705,16 +749,13 @@ impl Vmm {
         // It breaks out of the state machine loop so that the thread can be joined.
         for (idx, handle) in self.vcpus_handles.iter().enumerate() {
             if let Err(e) = handle.send_event(VcpuEvent::Finish) {
-                error!(
-                    "Failed to send VcpuEvent::Finish to vCPU {}. Error: {}",
-                    idx, e
-                );
+                error!("Failed to send VcpuEvent::Finish to vCPU {}: {}", idx, e);
             }
         }
         // The actual thread::join() that runs to release the thread's resource is done in
         // the VcpuHandle's Drop trait.  We can trigger that to happen now by clearing the
         // list of handles. Do it here instead of Vmm::Drop to avoid dependency cycles.
-        // (Vmm's Drop will also assert this list is empty).
+        // (Vmm's Drop will also check if this list is empty).
         self.vcpus_handles.clear();
 
         // Break the main event loop, propagating the Vmm exit-code.
@@ -749,6 +790,29 @@ fn construct_kvm_mpidrs(vcpu_states: &[VcpuState]) -> Vec<u64> {
 
 impl Drop for Vmm {
     fn drop(&mut self) {
+        // There are two cases when `drop()` is called:
+        // 1) before the Vmm has been mutexed and subscribed to the event
+        //    manager, or
+        // 2) after the Vmm has been registered as a subscriber to the
+        //    event manager.
+        //
+        // The first scenario is bound to happen if an error is raised during
+        // Vmm creation (for example, during snapshot load), before the Vmm has
+        // been subscribed to the event manager. If that happens, the `drop()`
+        // function is called right before propagating the error. In order to
+        // be able to gracefully exit Firecracker with the correct fault
+        // message, we need to prepare the Vmm contents for the tear down
+        // (join the vcpu threads). Explicitly calling `stop()` allows the
+        // Vmm to be successfully dropped and firecracker to propagate the
+        // error.
+        //
+        // In the second case, before dropping the Vmm object, the event
+        // manager calls `stop()`, which sends a `Finish` event to the vcpus
+        // and joins the vcpu threads. The Vmm is dropped after everything is
+        // ready to be teared down. The line below is a no-op, because the Vmm
+        // has already been stopped by the event manager at this point.
+        self.stop(self.shutdown_exit_code.unwrap_or(FC_EXIT_CODE_OK));
+
         if let Some(observer) = self.events_observer.as_mut() {
             if let Err(e) = observer.on_vmm_stop() {
                 warn!("{}", Error::VmmObserverTeardown(e));
@@ -760,7 +824,12 @@ impl Drop for Vmm {
             error!("Failed to write metrics while stopping: {}", e);
         }
 
-        assert!(self.vcpus_handles.is_empty());
+        if !self.vcpus_handles.is_empty() {
+            error!(
+                "Failed to tear down Vmm: the vcpu threads \
+                have not finished execution."
+            );
+        }
     }
 }
 

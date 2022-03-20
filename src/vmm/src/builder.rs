@@ -36,9 +36,11 @@ use crate::vstate::{
     vcpu::{Vcpu, VcpuConfig},
     vm::Vm,
 };
-use crate::{device_manager, Error, EventManager, Vmm, VmmEventsObserver};
+use crate::{device_manager, mem_size_mib, Error, EventManager, Vmm, VmmEventsObserver};
 
+use crate::resources::VmResources;
 use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::machine_config::{VmConfigError, VmUpdateConfig};
 use arch::InitrdConfig;
 #[cfg(target_arch = "x86_64")]
 use cpuid::common::is_same_model;
@@ -97,6 +99,8 @@ pub enum StartMicrovmError {
     RegisterMmioDevice(device_manager::mmio::Error),
     /// Cannot restore microvm state.
     RestoreMicrovmState(MicrovmStateError),
+    /// Unable to set VmResources.
+    SetVmResources(VmConfigError),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -112,7 +116,7 @@ impl Display for StartMicrovmError {
         use self::StartMicrovmError::*;
         match self {
             AttachBlockDevice(err) => {
-                write!(f, "Unable to attach block device to Vmm. Error: {}", err)
+                write!(f, "Unable to attach block device to Vmm: {}", err)
             }
             ConfigureSystem(e) => write!(f, "System configuration error: {:?}", e),
             CreateRateLimiter(err) => write!(f, "Cannot create RateLimiter: {}", err),
@@ -178,6 +182,7 @@ impl Display for StartMicrovmError {
                 )
             }
             RestoreMicrovmState(err) => write!(f, "Cannot restore microvm state. Error: {}", err),
+            SetVmResources(err) => write!(f, "Cannot set vm resources. Error: {}", err),
         }
     }
 }
@@ -324,20 +329,34 @@ pub fn build_microvm_for_boot(
     let boot_config = vm_resources.boot_source().ok_or(MissingKernelConfig)?;
 
     let track_dirty_pages = vm_resources.track_dirty_pages();
-    let guest_memory = create_guest_memory(
-        vm_resources
-            .vm_config()
-            .mem_size_mib
-            .ok_or(MissingMemSizeConfig)?,
-        track_dirty_pages,
-    )?;
+    let guest_memory =
+        create_guest_memory(vm_resources.vm_config().mem_size_mib, track_dirty_pages)?;
     let vcpu_config = vm_resources.vcpu_config();
     let entry_addr = load_kernel(boot_config, &guest_memory)?;
     let initrd = load_initrd_from_config(boot_config, &guest_memory)?;
     // Clone the command-line so that a failed boot doesn't pollute the original.
     #[allow(unused_mut)]
     let mut boot_cmdline = linux_loader::cmdline::Cmdline::new(arch::CMDLINE_MAX_SIZE);
-    boot_cmdline.insert_str(boot_config.cmdline.as_str())?;
+
+    // We're splitting the boot_args in regular parameters and init arguments.
+    // This is needed because on x86_64 we're altering the boot arguments by
+    // adding the virtio device configuration. We need to make sure that the init
+    // parameters are last, specified after -- as specified in the kernel docs
+    // (https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html).
+    let init_and_regular = boot_config
+        .cmdline
+        .as_str()
+        .split("--")
+        .collect::<Vec<&str>>();
+    if init_and_regular.len() > 2 {
+        return Err(StartMicrovmError::KernelCmdline(
+            "Too many `--` in kernel cmdline.".to_string(),
+        ));
+    }
+    let boot_args = init_and_regular[0];
+    let init_params = init_and_regular.get(1);
+
+    boot_cmdline.insert_str(boot_args)?;
 
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
         instance_info,
@@ -372,6 +391,10 @@ pub fn build_microvm_for_boot(
     )?;
     if let Some(unix_vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, &mut boot_cmdline, unix_vsock, event_manager)?;
+    }
+
+    if let Some(init) = init_params {
+        boot_cmdline.insert_str(format!("--{}", init))?;
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -428,6 +451,7 @@ pub fn build_microvm_from_snapshot(
     guest_memory: GuestMemoryMmap,
     track_dirty_pages: bool,
     seccomp_filters: &BpfThreadMap,
+    vm_resources: &mut VmResources,
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     use self::StartMicrovmError::*;
     let vcpu_count = u8::try_from(microvm_state.vcpu_states.len())
@@ -495,16 +519,31 @@ pub fn build_microvm_from_snapshot(
         .map_err(MicrovmStateError::RestoreVmState)
         .map_err(RestoreMicrovmState)?;
 
+    vm_resources
+        .update_vm_config(&VmUpdateConfig {
+            vcpu_count: Some(vcpu_count),
+            mem_size_mib: Some(mem_size_mib(&guest_memory) as usize),
+            smt: Some(false),
+            cpu_template: None,
+            track_dirty_pages: Some(track_dirty_pages),
+        })
+        .map_err(SetVmResources)?;
+
     // Restore devices states.
     let mmio_ctor_args = MMIODevManagerConstructorArgs {
         mem: guest_memory,
         vm: vmm.vm.fd(),
         event_manager,
+        for_each_restored_device: VmResources::update_from_restored_device,
+        vm_resources,
     };
+
     vmm.mmio_device_manager =
         MMIODeviceManager::restore(mmio_ctor_args, &microvm_state.device_states)
             .map_err(MicrovmStateError::RestoreDevices)
             .map_err(RestoreMicrovmState)?;
+    vmm.emulate_serial_init()
+        .map_err(StartMicrovmError::Internal)?;
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
     vmm.start_vcpus(
@@ -951,11 +990,12 @@ pub mod tests {
     use super::*;
     use crate::vmm_config::balloon::{BalloonBuilder, BalloonDeviceConfig, BALLOON_DEV_ID};
     use crate::vmm_config::boot_source::DEFAULT_KERNEL_CMDLINE;
-    use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig, CacheType};
+    use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig, CacheType, FileEngineType};
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
     use arch::DeviceType;
+    use devices::virtio::vsock::VSOCK_DEV_ID;
     use devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_VSOCK};
     use linux_loader::cmdline::Cmdline;
     use utils::tempfile::TempFile;
@@ -1077,6 +1117,7 @@ pub mod tests {
                 is_read_only: custom_block_cfg.is_read_only,
                 cache_type: custom_block_cfg.cache_type,
                 rate_limiter: None,
+                file_engine_type: FileEngineType::default(),
             };
             block_dev_configs.insert(block_device_config).unwrap();
         }
@@ -1104,7 +1145,7 @@ pub mod tests {
         event_manager: &mut EventManager,
         vsock_config: VsockDeviceConfig,
     ) {
-        let vsock_dev_id = vsock_config.vsock_id.clone();
+        let vsock_dev_id = VSOCK_DEV_ID.to_owned();
         let vsock = VsockBuilder::create_unixsock_vsock(vsock_config).unwrap();
         let vsock = Arc::new(Mutex::new(vsock));
 
@@ -1248,7 +1289,6 @@ pub mod tests {
             guest_mac: None,
             rx_rate_limiter: None,
             tx_rate_limiter: None,
-            allow_mmds_requests: true,
         };
 
         let mut cmdline = default_kernel_cmdline();

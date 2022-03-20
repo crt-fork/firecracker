@@ -7,7 +7,7 @@ FROM ubuntu:18.04
 ARG RUST_TOOLCHAIN="1.52.1"
 ARG TINI_VERSION_TAG="v0.18.0"
 ARG TMP_BUILD_DIR=/tmp/build
-ARG TMP_POETRY_DIR=/tmp/poetry
+ARG TMP_POETRY_DIR
 ARG FIRECRACKER_SRC_DIR="/firecracker"
 ARG FIRECRACKER_BUILD_DIR="$FIRECRACKER_SRC_DIR/build"
 ARG CARGO_REGISTRY_DIR="$FIRECRACKER_BUILD_DIR/cargo_registry"
@@ -84,6 +84,16 @@ RUN mkdir "$TMP_BUILD_DIR" \
         && ln -s "$CARGO_REGISTRY_DIR" "$CARGO_HOME/registry" \
         && rm -rf "$CARGO_HOME/git" \
         && ln -s "$CARGO_GIT_REGISTRY_DIR" "$CARGO_HOME/git" \
+    && cd / \
+    && rm -rf "$TMP_BUILD_DIR"
+
+# Build iperf3-vsock
+RUN mkdir "$TMP_BUILD_DIR" && cd "$TMP_BUILD_DIR" \
+    && git clone https://github.com/stefano-garzarella/iperf-vsock \
+    && cd iperf-vsock && git checkout 9245f9a \
+    && mkdir build && cd build \
+    && ../configure "LDFLAGS=--static" --disable-shared && make \
+    && cp src/iperf3 /usr/local/bin/iperf3-vsock \
     && cd / \
     && rm -rf "$TMP_BUILD_DIR"
 

@@ -11,10 +11,10 @@ use std::process;
 use std::sync::{Arc, Mutex};
 
 use event_manager::SubscriberOps;
-use logger::{error, info, warn, IncMetric, ProcessTimeReporter, LOGGER, METRICS};
+use logger::{error, info, ProcessTimeReporter, StoreMetric, LOGGER, METRICS};
 use seccompiler::BpfThreadMap;
 use snapshot::Snapshot;
-use utils::arg_parser::{ArgParser, Argument, Arguments};
+use utils::arg_parser::{ArgParser, Argument};
 use utils::terminal::Terminal;
 use utils::validators::validate_instance_id;
 use vmm::seccomp_filters::{get_filters, SeccompConfig};
@@ -30,6 +30,7 @@ use vmm::{resources::VmResources, EventManager, ExitCode};
 const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
 const FIRECRACKER_VERSION: &str = env!("FIRECRACKER_VERSION");
+const MMDS_CONTENT_ARG: &str = "metadata";
 
 #[cfg(target_arch = "aarch64")]
 /// Enable SSBD mitigation through `prctl`.
@@ -94,7 +95,7 @@ fn main_exitable() -> ExitCode {
             );
         }
 
-        METRICS.vmm.panic_count.inc();
+        METRICS.vmm.panic_count.store(1);
 
         // Write the metrics before aborting.
         if let Err(e) = METRICS.write() {
@@ -116,15 +117,9 @@ fn main_exitable() -> ExitCode {
                 .help("MicroVM unique identifier."),
         )
         .arg(
-            Argument::new("seccomp-level")
-                .takes_value(true)
-                .help("Deprecated! Level of seccomp filtering (0: no filter | 1: filter by syscall number | 2: filter by syscall \
-                number and argument values.")
-        )
-        .arg(
             Argument::new("seccomp-filter")
                 .takes_value(true)
-                .forbids(vec!["seccomp-level", "no-seccomp"])
+                .forbids(vec!["no-seccomp"])
                 .help(
                     "Optional parameter which allows specifying the path to a custom seccomp filter. For advanced users."
                 ),
@@ -132,7 +127,7 @@ fn main_exitable() -> ExitCode {
         .arg(
             Argument::new("no-seccomp")
                 .takes_value(false)
-                .forbids(vec!["seccomp-level"])
+                .forbids(vec!["seccomp-filter"])
                 .help("Optional parameter which allows starting and using a microVM without seccomp filtering. \
                     Not recommended.")
         )
@@ -155,6 +150,11 @@ fn main_exitable() -> ExitCode {
             Argument::new("config-file")
                 .takes_value(true)
                 .help("Path to a file that contains the microVM configuration in JSON format."),
+        )
+        .arg(
+            Argument::new(MMDS_CONTENT_ARG)
+                .takes_value(true)
+                .help("Path to a file that contains metadata in JSON format to add to the mmds.")
         )
         .arg(
             Argument::new("no-api")
@@ -202,7 +202,7 @@ fn main_exitable() -> ExitCode {
                 .help("Print the data format version of the provided snapshot state file.")
         )
         .arg(
-            Argument::new("http_api_max_payload_size")
+            Argument::new("http-api-max-payload-size")
                 .takes_value(true)
                 .help("Http API request payload max size.")
         );
@@ -239,7 +239,9 @@ fn main_exitable() -> ExitCode {
     };
 
     // Display warnings for any used deprecated parameters.
-    warn_deprecated_parameters(&arguments);
+    // Currently unused since there are no deprecated parameters. Uncomment the line when
+    // deprecating one.
+    // warn_deprecated_parameters(&arguments);
 
     // It's safe to unwrap here because the field's been provided with a default value.
     let instance_id = arguments.single_value("id").unwrap();
@@ -282,7 +284,6 @@ fn main_exitable() -> ExitCode {
     }
 
     let mut seccomp_filters: BpfThreadMap = match SeccompConfig::from_args(
-        arguments.single_value("seccomp-level"),
         arguments.flag_present("no-seccomp"),
         arguments.single_value("seccomp-filter"),
     )
@@ -299,21 +300,26 @@ fn main_exitable() -> ExitCode {
         .map(fs::read_to_string)
         .map(|x| x.expect("Unable to open or read from the configuration file"));
 
+    let metadata_json = arguments
+        .single_value(MMDS_CONTENT_ARG)
+        .map(fs::read_to_string)
+        .map(|x| x.expect("Unable to open or read from the mmds content file"));
+
     let boot_timer_enabled = arguments.flag_present("boot-timer");
     let api_enabled = !arguments.flag_present("no-api");
+    let payload_limit = arg_parser
+        .arguments()
+        .single_value("http-api-max-payload-size")
+        .map(|lim| {
+            lim.parse::<usize>()
+                .expect("'http-api-max-payload-size' parameter expected to be of 'usize' type.")
+        });
 
     if api_enabled {
         let bind_path = arguments
             .single_value("api-sock")
             .map(PathBuf::from)
             .expect("Missing argument: api-sock");
-        let payload_limit = arg_parser
-            .arguments()
-            .single_value("http_api_max_payload_size")
-            .map(|lim| {
-                lim.parse::<usize>()
-                    .expect("'http_api_max_payload_size' parameter expected to be of 'usize' type.")
-            });
 
         let start_time_us = arguments.single_value("start-time-us").map(|s| {
             s.parse::<u64>()
@@ -340,6 +346,7 @@ fn main_exitable() -> ExitCode {
             process_time_reporter,
             boot_timer_enabled,
             payload_limit,
+            metadata_json.as_deref(),
         )
     } else {
         let seccomp_filters: BpfThreadMap = seccomp_filters
@@ -351,6 +358,8 @@ fn main_exitable() -> ExitCode {
             vmm_config_json,
             instance_info,
             boot_timer_enabled,
+            payload_limit,
+            metadata_json.as_deref(),
         )
     }
 }
@@ -377,16 +386,8 @@ fn generic_error_exit(msg: &str) -> ExitCode {
 }
 
 // Log a warning for any usage of deprecated parameters.
-fn warn_deprecated_parameters(arguments: &Arguments) {
-    // --seccomp-level is deprecated.
-    if let Some(value) = arguments.single_value("seccomp-level") {
-        warn!(
-            "You are using a deprecated parameter: --seccomp-level {}, that will be removed in a \
-            future version.",
-            value
-        );
-    }
-}
+#[allow(unused)]
+fn warn_deprecated_parameters() {}
 
 // Print supported snapshot data format versions.
 fn print_supported_snapshot_versions() {
@@ -439,14 +440,15 @@ fn build_microvm_from_json(
     config_json: String,
     instance_info: InstanceInfo,
     boot_timer_enabled: bool,
+    mmds_max_size: Option<usize>,
+    metadata_json: Option<&str>,
 ) -> std::result::Result<(VmResources, Arc<Mutex<vmm::Vmm>>), ExitCode> {
-    let mut vm_resources = VmResources::from_json(&config_json, &instance_info).map_err(|err| {
-        error!(
-            "Configuration for VMM from one single json failed: {:?}",
-            err
-        );
-        vmm::FC_EXIT_CODE_BAD_CONFIGURATION
-    })?;
+    let mut vm_resources =
+        VmResources::from_json(&config_json, &instance_info, mmds_max_size, metadata_json)
+            .map_err(|err| {
+                error!("Configuration for VMM from one single json failed: {}", err);
+                vmm::FC_EXIT_CODE_BAD_CONFIGURATION
+            })?;
     vm_resources.boot_timer = boot_timer_enabled;
     let vmm = vmm::builder::build_microvm_for_boot(
         &instance_info,
@@ -471,6 +473,8 @@ fn run_without_api(
     config_json: Option<String>,
     instance_info: InstanceInfo,
     bool_timer_enabled: bool,
+    mmds_max_size: Option<usize>,
+    metadata_json: Option<&str>,
 ) -> ExitCode {
     let mut event_manager = EventManager::new().expect("Unable to create EventManager");
 
@@ -486,6 +490,8 @@ fn run_without_api(
         config_json.unwrap(),
         instance_info,
         bool_timer_enabled,
+        mmds_max_size,
+        metadata_json,
     ) {
         Ok((res, vmm)) => (res, vmm),
         Err(exit_code) => return exit_code,

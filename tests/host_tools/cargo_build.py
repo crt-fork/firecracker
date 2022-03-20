@@ -5,7 +5,7 @@
 import os
 import platform
 
-import framework.utils as utils
+from framework import utils
 from framework import defs
 
 from framework.defs import (
@@ -127,6 +127,28 @@ def run_seccompiler_bin(bpf_path,
 
     if basic:
         cmd += ' --basic'
+
+    rc, _, _ = utils.run_cmd(cmd)
+
+    assert rc == 0
+
+
+def run_rebase_snap_bin(base_snap,
+                        diff_snap):
+    """
+    Run apply_diff_snap.
+
+    :param base_snap: path to the base snapshot mem file
+    :param diff_snap: path to diff snapshot mem file
+    """
+    cargo_target = '{}-unknown-linux-musl'.format(platform.machine())
+
+    cmd = 'cargo run -p rebase-snap --target {} --\
+        --base-file {} --diff-file {}'.format(
+        cargo_target,
+        base_snap,
+        diff_snap
+    )
 
     rc, _, _ = utils.run_cmd(cmd)
 

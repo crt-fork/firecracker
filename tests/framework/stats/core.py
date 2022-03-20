@@ -61,7 +61,7 @@ class Core:
     def run_exercise(self, fail_fast=False) -> Result:
         """Drive the statistics producers until completion."""
         iterations = self._result['iterations']
-        # This is used for identation purposes.
+
         for tag, pipe in self._pipes.items():
             for iteration in range(iterations):
                 raw_data = pipe.producer.produce()
@@ -72,7 +72,7 @@ class Core:
                     pipe.consumer.ingest(iteration, raw_data)
             try:
                 stats, custom = pipe.consumer.process(fail_fast)
-            except ProcessingException as err:
+            except (ProcessingException, AssertionError) as err:
                 self._failure_aggregator.add_row(f"Failed on '{tag}':")
                 self._failure_aggregator.add_row(err)
                 stats = err.stats

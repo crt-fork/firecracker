@@ -39,8 +39,10 @@ type Result<T> = std::result::Result<T, VsockConfigError>;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VsockDeviceConfig {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     /// ID of the vsock device.
-    pub vsock_id: String,
+    pub vsock_id: Option<String>,
     /// A 32-bit Context Identifier (CID) used to identify the guest.
     pub guest_cid: u32,
     /// Path to local unix socket.
@@ -56,7 +58,7 @@ impl From<&VsockAndUnixPath> for VsockDeviceConfig {
     fn from(vsock: &VsockAndUnixPath) -> Self {
         let vsock_lock = vsock.vsock.lock().unwrap();
         VsockDeviceConfig {
-            vsock_id: vsock_lock.id().to_string(),
+            vsock_id: None,
             guest_cid: u32::try_from(vsock_lock.cid()).unwrap(),
             uds_path: vsock.uds_path.clone(),
         }
@@ -73,6 +75,19 @@ impl VsockBuilder {
     /// Creates an empty Vsock with Unix backend Store.
     pub fn new() -> Self {
         Self { inner: None }
+    }
+
+    /// Inserts an existing vsock device.
+    pub fn set_device(&mut self, device: Arc<Mutex<Vsock<VsockUnixBackend>>>) {
+        self.inner = Some(VsockAndUnixPath {
+            uds_path: device
+                .lock()
+                .expect("Poisoned lock")
+                .backend()
+                .host_sock_path()
+                .to_owned(),
+            vsock: device.clone(),
+        });
     }
 
     /// Inserts a Unix backend Vsock in the store.
@@ -113,11 +128,12 @@ impl VsockBuilder {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use devices::virtio::vsock::VSOCK_DEV_ID;
     use utils::tempfile::TempFile;
 
     pub(crate) fn default_config(tmp_sock_file: &TempFile) -> VsockDeviceConfig {
         VsockDeviceConfig {
-            vsock_id: "vsock".to_string(),
+            vsock_id: None,
             guest_cid: 3,
             uds_path: tmp_sock_file.as_path().to_str().unwrap().to_string(),
         }
@@ -140,7 +156,7 @@ pub(crate) mod tests {
 
         store.insert(vsock_config.clone()).unwrap();
         let vsock = store.get().unwrap();
-        assert_eq!(vsock.lock().unwrap().id(), &vsock_config.vsock_id);
+        assert_eq!(vsock.lock().unwrap().id(), VSOCK_DEV_ID);
 
         let new_cid = vsock_config.guest_cid + 1;
         vsock_config.guest_cid = new_cid;
@@ -175,5 +191,25 @@ pub(crate) mod tests {
             io::Error::from_raw_os_error(0),
         ));
         let _ = format!("{}{:?}", err, err);
+    }
+
+    #[test]
+    fn test_set_device() {
+        let mut vsock_builder = VsockBuilder::new();
+        let mut tmp_sock_file = TempFile::new().unwrap();
+        tmp_sock_file.remove().unwrap();
+        let vsock = Vsock::new(
+            0,
+            VsockUnixBackend::new(1, tmp_sock_file.as_path().to_str().unwrap().to_string())
+                .unwrap(),
+        )
+        .unwrap();
+
+        vsock_builder.set_device(Arc::new(Mutex::new(vsock)));
+        assert!(vsock_builder.inner.is_some());
+        assert_eq!(
+            vsock_builder.inner.unwrap().uds_path,
+            tmp_sock_file.as_path().to_str().unwrap().to_string()
+        )
     }
 }

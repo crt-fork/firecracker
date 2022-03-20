@@ -72,7 +72,7 @@
 DEVCTR_IMAGE_NO_TAG="public.ecr.aws/firecracker/fcuvm"
 
 # Development container tag
-DEVCTR_IMAGE_TAG="v31"
+DEVCTR_IMAGE_TAG="v34"
 
 # Development container image (name:tag)
 # This should be updated whenever we upgrade the development container.
@@ -114,6 +114,9 @@ CARGO_TARGET_DIR="${FC_BUILD_DIR}/cargo_target"
 # Full path to the seccompiler cargo target dir on the host.
 CARGO_SECCOMPILER_TARGET_DIR="${FC_BUILD_DIR}/seccompiler"
 
+# Full path to the rebase-snap cargo target dir on the host.
+CARGO_REBASE_SNAP_TARGET_DIR="${FC_BUILD_DIR}/rebase-snap"
+
 # Full path to the Firecracker sources dir, as bind-mounted in the container.
 CTR_FC_ROOT_DIR="/firecracker"
 
@@ -126,8 +129,15 @@ CTR_CARGO_TARGET_DIR="$CTR_FC_BUILD_DIR/cargo_target"
 # Full path to the seccompiler cargo target dir, as bind-mounted in the container.
 CTR_CARGO_SECCOMPILER_TARGET_DIR="$CTR_FC_BUILD_DIR/seccompiler"
 
+# Full path to the rebase-snap cargo target dir, as bind-mounted in the container.
+CTR_CARGO_REBASE_SNAP_TARGET_DIR="$CTR_FC_BUILD_DIR/rebase-snap"
+
 # Full path to the microVM images cache dir
 CTR_MICROVM_IMAGES_DIR="$CTR_FC_BUILD_DIR/img"
+
+# Full path to the poetry tmp directory on the container, used for holding
+# the lock and toml files.
+CTR_POETRY_TMP_DIR="/tmp/poetry"
 
 # Full path to the public key mapping on the guest
 PUB_KEY_PATH=/root/.ssh/id_rsa.pub
@@ -286,21 +296,45 @@ ensure_build_dir() {
     done
 }
 
-# Makes sure that Firecracker release binaries were built.
-# This is relevant in the context of stripping the already built release binaries.
+build_fc_bin_path() {
+    target="$1"
+    profile="$2"
+    echo "$CARGO_TARGET_DIR/$target/$profile/firecracker"
+}
+
+build_jailer_bin_path() {
+    target="$1"
+    profile="$2"
+    echo "$CARGO_TARGET_DIR/$target/$profile/jailer"
+}
+
+build_seccomp_bin_path() {
+    target="$1"
+    profile="$2"
+    echo "$CARGO_SECCOMPILER_TARGET_DIR/$target/$profile/seccompiler-bin"
+}
+
+build_rebase_snap_bin_path() {
+    target="$1"
+    profile="$2"
+    echo "$CARGO_REBASE_SNAP_TARGET_DIR/$target/$profile/rebase-snap"
+}
+
 ensure_release_binaries_exist() {
     target=$1
     profile=$2
-    firecracker_bin_path="$CARGO_TARGET_DIR/$target/$profile/firecracker"
-    jailer_bin_path="$CARGO_TARGET_DIR/$target/$profile/jailer"
-    seccompiler_bin_path="$CARGO_SECCOMPILER_TARGET_DIR/$target/$profile/seccompiler-bin"
+    firecracker_bin_path=$( build_fc_bin_path "$target" "$profile")
+    jailer_bin_path=$( build_jailer_bin_path "$target" "$profile")
+    seccompiler_bin_path=$( build_seccomp_bin_path "$target" "$profile")
+    rebase_snap_bin_path=$( build_rebase_snap_bin_path "$target" "$profile")
 
-    # Both binaries must exist for the stripping to be successful.
-    [ -f "$firecracker_bin_path" ] && [ -f "$jailer_bin_path" ] && [ -f "$seccompiler_bin_path" ] || \
+    { [ -f "$firecracker_bin_path" ] && [ -f "$jailer_bin_path" ] && [ -f "$seccompiler_bin_path" ] && \
+    [ -f "$rebase_snap_bin_path" ]; } || \
     die "Missing release binaries. Needed files:\n" \
     "* $firecracker_bin_path\n" \
     "* $jailer_bin_path\n" \
     "* $seccompiler_bin_path\n" \
+    "* $rebase_snap_bin_path\n" \
     "To build the binaries, run:\n\t$0 build --$profile"
 }
 
@@ -322,16 +356,14 @@ cmd_fix_perms() {
 cmd_build_devctr() {
     arch=$(uname -m)
     docker_file_name="Dockerfile.$arch"
-    should_update_python_packages=true
-    build_args=""
+    build_args="--build-arg TMP_POETRY_DIR=$CTR_POETRY_TMP_DIR"
 
     while [ $# -gt 0 ]; do
         case "$1" in
             "-h"|"--help")      { cmd_help; exit 1; } ;;
-            "-n"|"--no-python-package-update")
+            "-n"|"--no-python-package-upgrade")
                 shift
-                should_update_python_packages=false
-                build_args="--build-arg POETRY_LOCK_PATH=tools/devctr/poetry.lock"
+                build_args="$build_args --build-arg POETRY_LOCK_PATH=tools/devctr/poetry.lock"
                 ;;
             "--")               { shift; break;     } ;;
             *)
@@ -343,9 +375,9 @@ cmd_build_devctr() {
 
     docker build -t "$DEVCTR_IMAGE_NO_TAG" -f "$FC_DEVCTR_DIR/$docker_file_name" $build_args .
 
-    if [ "$should_update_python_packages" = true ]; then
-        update_python_package_version
-    fi
+    # Copy back the lockfile, since a new dependency or version would have
+    # updated it.
+    copy_poetry_lockfile
 }
 
 # Prompt the user for confirmation before proceeding.
@@ -376,18 +408,20 @@ get_user_confirmation() {
 }
 
 # Validate the user supplied version number.
-# It must be composed of 3 groups of integers separated by dot.
-#
+# It must start with 3 groups of integers separated by dot and
+# must not contain `wip` or `dirty`.
 validate_version() {
-    declare version_regex="^([0-9]+.){2}[0-9]+$"
+    declare version_regex="^([0-9]+\.){2}[0-9]+"
     version="$1"
 
     if [ -z "$version" ]; then
         die "Version cannot be empty."
     elif [[ ! "$version" =~ $version_regex ]]; then
-        die "Invalid version number: $version (expected: \$Major.\$Minor.\$Build)."
+        die "Invalid version number: $version. Version should start with \$Major.\$Minor.\$Build, see
+        https://github.com/firecracker-microvm/firecracker/blob/main/docs/RELEASE_POLICY.md for more information."
+    elif [[ "$version" == *"wip"* ]] || [[ "$version" == *"dirty"* ]]; then
+        die "Invalid version number: $version. Version should not contain \`wip\` or \`dirty\`."
     fi
-
 }
 
 # Validate that the repo targetted for a release exists.
@@ -411,7 +445,7 @@ check_release_tag() {
     say "Fetching remote tags..."
     git fetch upstream --tags
 
-    if git rev-parse v$1 >/dev/null 2>&1; then
+    if git tag | grep v$1 >/dev/null 2>&1; then
         say_err "Seems that tag provided is already associated with a release! "
         say "Will skip drafting a new release for now."
         return 1
@@ -468,7 +502,7 @@ compose_release_text() {
 
 get_prev_release() {
     declare version=$1
-    declare pat_release="^## \[([0-9]+\.){2}[0-9]+\]"
+    declare pat_release="^## \[([0-9]+\.){2}[0-9]+.*\]$"
     declare changelog="$FC_ROOT_DIR/CHANGELOG.md"
 
     grep -q "\[$version\]" "$changelog"
@@ -509,11 +543,10 @@ generate_release_post_data() {
   cat <<EOF
 {
   "tag_name": "v$1",
-  "target_commitish": "$2",
   "name": "Firecracker v$1",
-  "body": "$4",
+  "body": "$3",
   "draft": $draft,
-  "prerelease": $3
+  "prerelease": $2
 }
 EOF
 }
@@ -521,12 +554,11 @@ EOF
 # Call into GitHub's API to draft a release.
 post_release() {
     version="$1"
-    branch="$2"
-    user="$3"
-    repo="$4"
-    token="$5"
-    prerelease="$6"
-    release_text="$7"
+    user="$2"
+    repo="$3"
+    token="$4"
+    prerelease="$5"
+    release_text="$6"
     # Will always create a draft release.
     draft="true"
 
@@ -534,8 +566,8 @@ post_release() {
     # literal newlines (i.e \n).
     # Second pass: escape quotation marks.
     json_changelog_content=$(echo "$release_text" | awk '{printf "%s\\n", $0}' | sed 's/\"/\\"/g')
-    API_JSON="$(generate_release_post_data $version $branch $prerelease "$json_changelog_content")"
-    API_RESPONSE_STATUS=$(curl -H "Authorization: token $token" --data "$API_JSON" -s -i https://api.github.com/repos/$3/$4/releases)
+    API_JSON="$(generate_release_post_data $version $prerelease "$json_changelog_content")"
+    API_RESPONSE_STATUS=$(curl -H "Authorization: token $token" --data "$API_JSON" -s -i https://api.github.com/repos/"$user"/"$repo"/releases)
 
     if [[ ! "$API_RESPONSE_STATUS" == *"HTTP/2 201"* ]]; then
         die "Could not post release: $API_RESPONSE_STATUS"
@@ -596,32 +628,20 @@ test_key() {
     [ $ret -ne 0 ] && die "$1 is not a valid key file."
 }
 
-# Tries to update any outdated python packages on the container,
-# locks the new versions and copies back the ```poetry.lock```
-# file to the host.
+# Copies the ```poetry.lock``` file to the host, upgrading the versions if
+# requested.
 #
-update_python_package_version() {
-    say "Updating python packages..."
-
+copy_poetry_lockfile() {
     # defined in Dockerfile
-    poetry_dir_on_container="/tmp/poetry"
     lock_file_location_on_host="$FC_DEVCTR_DIR/poetry.lock"
     image_id=$(docker images -q "$DEVCTR_IMAGE_NO_TAG" | head -n 1)
     dummy_container_name=$(uuidgen)
-    dummy_container_id=$(docker create -ti --name \
-        "$dummy_container_name" \
-        "$image_id" \
-        bash)
+    dummy_container_id=$(docker create --name "$dummy_container_name" "$image_id" bash)
 
-    docker start "$dummy_container_id"
-    cmd="cd "$poetry_dir_on_container"; poetry update"
-    docker exec -ti "$dummy_container_id" /bin/bash -c "${cmd}"
     docker cp \
-        "$dummy_container_id":/tmp/poetry/poetry.lock \
+        "$dummy_container_id":"$CTR_POETRY_TMP_DIR"/poetry.lock \
         "$lock_file_location_on_host"
-    docker commit "$dummy_container_id" "$DEVCTR_IMAGE_NO_TAG"
 
-    docker stop "$dummy_container_id"
     docker rm -f "$dummy_container_name"
 }
 
@@ -671,9 +691,13 @@ cmd_help() {
     echo "        Builds a kernel image custom-tailored for our CI."
     echo "        -c, --config  Path to the config file."
     echo "        -n, --nproc  Number of cores to use for building kernel."
+
+    help_build_release_archive
+
     echo "    build_rootfs -s|--size [--partuuid]"
     echo "        Builds a rootfs image custom-tailored for use in our CI."
-    echo "        -s, --size      Size of the rootfs image. Defaults to 300M."
+    echo "        -s, --size      Size of the rootfs image. Defaults to 300MB.
+                                  The format is the same as that of 'truncates'."
     echo "        -p, --partuuid  Whether to build a partuuid image."
     echo ""
     echo "    checkenv"
@@ -682,6 +706,10 @@ cmd_help() {
     echo "    ci"
     echo "        Run a continuous integration test run that executes the integration tests and"
     echo "        checks that the release process works."
+    echo ""
+    echo "    create_snapshot_artifacts"
+    echo "        Runs a tool that generates snapshot artifacts for supported kernel versions."
+    echo "        Snapshot mem and state files are saved under \`snapshot_artifacts/\` directory"
     echo ""
     echo "    distclean"
     echo "        Clean up the build tree and remove the docker container."
@@ -759,6 +787,7 @@ help_release() {
     echo "        -v, --version             The targeted release version."
     echo "        -o, --owner               The GitHub owner of the targeted repo."
     echo "        -t, --token               A GitHub Access token with "repo" permissions"
+    echo "        -b, --branch              Branch or commit hash to create the tag to."
     echo "        -r, --repo                The name of the repository where the release will be posted."
     echo "        -m, --remote              The name of the remote where the release tag will be pushed."
     echo "        -p, --prerelease          Marks the release as a pre-release."
@@ -777,6 +806,17 @@ help_upload_assets() {
     echo "        -t, --token               A GitHub Access token with "repo" permissions"
     echo "        -r, --repo                The name of the repository where the draft release exists."
     echo "        -a, --asset               Path to asset to be uploaded."
+}
+
+help_build_release_archive() {
+    echo "    build_release_archive -v <val>"
+    echo "        Building the release archive involves the following steps:"
+    echo "            1. Running integration tests."
+    echo "            2. Building release binaries and stripping them of debug symbols."
+    echo "            3. Verifying artifacts' version against release version targeted."
+    echo "            4. Packing all artifacts into \`release-v{version}-{arch}\` directory."
+    echo "            5. Creating firecracker-v{version}-{arch} release archive."
+    echo "        -v, --version             The targeted release version."
 }
 
 # `$0 build` - build Firecracker
@@ -876,6 +916,17 @@ cmd_build() {
 
     [ $ret -ne 0 ] && return $ret
 
+    # Build rebase-snap.
+    run_devctr \
+        --user "$(id -u):$(id -g)" \
+        --workdir "$CTR_FC_ROOT_DIR" \
+        ${extra_args} \
+        -- \
+        cargo build -p rebase-snap \
+            --target-dir "$CTR_CARGO_REBASE_SNAP_TARGET_DIR" \
+            "${cargo_args[@]}"
+    ret=$?
+
     # Build Firecracker.
     run_devctr \
         --user "$(id -u):$(id -g)" \
@@ -908,12 +959,14 @@ cmd_build() {
     [ $ret -eq 0 ] && {
         cargo_bin_dir="$CARGO_TARGET_DIR/$target/$profile"
         seccompiler_bin_dir="$CARGO_SECCOMPILER_TARGET_DIR/$target/$profile"
+        rebase_snap_bin_dir="$CARGO_REBASE_SNAP_TARGET_DIR/$target/$profile"
 
         # Seccompiler has a different build folder, we need to output two
         # messages.
         say "Build successful."
         say "Firecracker and Jailer binaries placed under $cargo_bin_dir"
         say "Seccompiler-bin binary placed under $seccompiler_bin_dir"
+        say "Rebase_snap binary placed under $rebase_snap_bin_dir"
     }
 
     return $ret
@@ -937,6 +990,9 @@ cmd_distclean() {
     fi
 }
 
+# Suppress "referencing arguments but none are ever passed" error, because
+# strip command accepts only --help argument.
+# shellcheck disable=SC2120
 cmd_strip() {
     profile="release"
     target="$TARGET_PREFIX""musl"
@@ -967,16 +1023,164 @@ cmd_strip() {
       strip $strip_flags\
         "$CTR_CARGO_TARGET_DIR/$target/$profile/firecracker" \
         "$CTR_CARGO_TARGET_DIR/$target/$profile/jailer" \
-        "$CTR_CARGO_SECCOMPILER_TARGET_DIR/$target/$profile/seccompiler-bin"
+        "$CTR_CARGO_SECCOMPILER_TARGET_DIR/$target/$profile/seccompiler-bin" \
+        "$CTR_CARGO_REBASE_SNAP_TARGET_DIR/$target/$profile/rebase-snap"
     ret=$?
 
     [ $ret -eq 0 ] && {
         say "Stripping was successful."
         say "Stripped Firecracker and Jailer binaries placed under $CARGO_TARGET_DIR/$target/$profile."
         say "Stripped seccompiler-bin binary placed under $CARGO_SECCOMPILER_TARGET_DIR/$target/$profile."
+        say "Stripped rebase-snap binary placed under $CARGO_REBASE_SNAP_TARGET_DIR/$target/$profile."
     }
 
     return $ret
+}
+
+cmd_build_release_archive() {
+    target="$TARGET_PREFIX""musl"
+    profile="release"
+    seccomp_json="resources/seccomp/$target.json"
+
+    # Parse any command line args.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            "-h"|"--help")      { help_build_release_archive; exit 1; } ;;
+            "-v"|"--version")   { version="$2"; shift 2;              } ;;
+            *)
+                die "Unknown argument: $1. Please use --help for help."
+        esac
+    done
+
+    validate_version "$version"
+    say "Will start preparing release archive for v$version ..."
+    get_user_confirmation || die "Aborted."
+    release_suffix="v$version-$(uname -m)"
+    archive_name="firecracker-$release_suffix.tgz"
+    archive_checksum="$archive_name.sha256.txt"
+    release_dir="release-$release_suffix"
+
+    # Build release binaries and strip them from debug symbols.
+    ( cmd_build --release && cmd_strip ) || die "Aborted."
+
+    # Create release directory or overwrite if it already exists.
+    rm -rf "$release_dir" && mkdir "$release_dir"
+
+    # Copy release artifacts to release directory.
+    say "Populating release artifacts directory..."
+    bin_paths=( "$(build_fc_bin_path "$target" "$profile")"
+                "$(build_jailer_bin_path "$target" "$profile")"
+                "$(build_seccomp_bin_path "$target" "$profile")"
+                "$(build_rebase_snap_bin_path "$target" "$profile")" )
+
+    for bin_path in "${bin_paths[@]}"; do
+        add_bin_artifact "$release_dir" "$bin_path" "$release_suffix"
+    done
+
+    add_swagger_artifact "$release_dir"
+    add_file_artifact "$release_dir" "$seccomp_json" "seccomp-filter-$release_suffix.json"
+    for file in "LICENSE" "NOTICE" "THIRD-PARTY"; do
+        add_file_artifact "$release_dir" "$file"
+    done
+
+    # Run tests to obtain test reports dir.
+    cmd_test || cleanup_release_dir "$release_dir" "Tests failed."
+    add_folder_artifact "$release_dir" "test_results" "$release_suffix"
+
+    # Create release archive.
+    say "Creating release archive..."
+    tar -czf "$archive_name" "$release_dir"
+    say "Done. Archive $archive_name successfully created."
+    say "Calculating checksum for release archive..."
+    sha256sum "$archive_name"  | awk '{print $1}' > "$archive_checksum"
+    say "Done. Saved checksum in $archive_checksum."
+}
+
+cleanup_release_dir() {
+    release_dir="$1"
+    error_msg="$2"
+
+    rm -rf "$release_dir"
+    die "$error_msg"
+}
+
+check_file_existence() {
+    artifact="$1"
+    if [ ! -f "$artifact" ]; then
+        die "Artifact $artifact does not exist!"
+    fi
+}
+
+add_swagger_artifact() {
+    local release_dir="$1"
+    local swagger_path="$FC_ROOT_DIR/src/api_server/swagger/firecracker.yaml"
+
+    check_file_existence "$swagger_path"
+
+    # Validate swagger version against target version.
+    swagger_ver=$(get_swagger_version "$swagger_path")
+    if [ ! "$swagger_ver" == "$version" ]; then
+        die "Swagger version: $swagger_ver does not match release version: $version."
+    fi
+
+    copy_release_artifact "$swagger_path" "$release_dir/firecracker_spec-v$version.yaml"
+}
+
+add_file_artifact() {
+    local release_dir="$1"
+    local path="$2"
+    local name="${3:-"$path"}"
+
+    check_file_existence "$path"
+    copy_release_artifact "$path" "$release_dir/$name"
+}
+
+add_bin_artifact() {
+    local release_dir="$1"
+    local path="$2"
+    local release_suffix="$3"
+
+    check_file_existence "$path"
+
+    # Validate binary version against target version.
+    output=$("$path" --version)
+    bin_version=$( echo "$output" | head -1 | grep -oP ' v\K.*')
+    if [[ ! "$bin_version" == "$version" ]]; then
+        die "Artifact $path's version: $bin_version does not match release version $version."
+    fi
+
+    formatted_name="$(basename "$path")-$release_suffix"
+    copy_release_artifact "$path" "$release_dir/$formatted_name"
+}
+
+add_folder_artifact() {
+    local release_dir="$1"
+    local path="$2"
+    local release_suffix="$3"
+
+    # Ensure the directory exists.
+    if [ ! -d "$path" ]; then
+        die "Artifact $path does not exist!"
+    fi
+    formatted_name="$(basename "$path")-$release_suffix"
+    copy_release_artifact "$path" "$release_dir/$formatted_name"
+}
+
+copy_release_artifact() {
+    local from_path="$1"
+    local to_path="$2"
+
+    say "Copying release artifact from $from_path to $to_path."
+    if [[ -f "$from_path" ]]; then
+        cp "$from_path" "$to_path"
+    elif [[ -d "$from_path" ]]; then
+        cp -r "$from_path" "$to_path"
+    fi
+}
+
+get_swagger_version() {
+    local file="$1"
+    grep -oP 'version: \K.*' "$file"
 }
 
 mount_ramdisk() {
@@ -1057,6 +1261,7 @@ cmd_test() {
         --security-opt seccomp=unconfined \
         --ulimit core=0 \
         --ulimit nofile=4096:4096 \
+        --ulimit memlock=-1:-1 \
         --workdir "$CTR_FC_ROOT_DIR/tests" \
         --cpuset-cpus="$cpuset_cpus" \
         --cpuset-mems="$cpuset_mems" \
@@ -1123,6 +1328,7 @@ cmd_shell() {
         run_devctr \
             --privileged \
             --ulimit nofile=4096:4096 \
+            --ulimit memlock=-1:-1 \
             --security-opt seccomp=unconfined \
             --workdir "$CTR_FC_ROOT_DIR" \
             ${ramdisk_args} \
@@ -1148,6 +1354,7 @@ cmd_shell() {
         run_devctr \
             --user "$(id -u):$(id -g)" \
             --ulimit nofile=4096:4096 \
+            --ulimit memlock=-1:-1 \
             --device=/dev/kvm:/dev/kvm \
             --workdir "$CTR_FC_ROOT_DIR" \
             --env PS1="$(whoami)@\h:\w\$ " \
@@ -1159,6 +1366,33 @@ cmd_shell() {
     if [[ $ramdisk = true ]]; then
         umount_ramdisk
     fi
+
+    return $ret
+}
+
+
+cmd_create_snapshot_artifacts() {
+    privileged=true
+
+    # Make sure we have what we need to continue.
+    ensure_devctr
+    ensure_build_dir
+
+    say "Creating snapshot artifacts ..."
+    run_devctr \
+        --privileged \
+        --ulimit nofile=4096:4096 \
+        --ulimit memlock=-1:-1 \
+        --security-opt seccomp=unconfined \
+        --workdir "$CTR_FC_ROOT_DIR" \
+        ${ramdisk_args} \
+        -- \
+        python3 tools/create_snapshot_artifact/main.py
+    ret=$?
+
+    # Running as root may have created some root-owned files under the build
+    # dir. Let's fix that.
+    cmd_fix_perms
 
     return $ret
 }
@@ -1217,7 +1451,7 @@ cmd_prepare_release() {
 
     # Get current version from the swagger spec.
     swagger="$FC_ROOT_DIR/src/api_server/swagger/firecracker.yaml"
-    curr_ver=$(grep "version: " "$swagger" | awk -F : '{print $2}' | tr -d ' ')
+    curr_ver=$(get_swagger_version "$swagger")
 
     say "Updating from $curr_ver to $version ..."
     get_user_confirmation || die "Aborted."
@@ -1279,19 +1513,23 @@ cmd_release() {
                 shift
                 local token="$1"
                 ;;
-             "-o"|"--owner")
+            "-b"|"--branch")
+                shift
+                local branch="$1"
+                ;;
+            "-o"|"--owner")
                 shift
                 local owner="$1"
                 ;;
-              "-r"|"--repo")
+            "-r"|"--repo")
                 shift
                 repo="$1"
                 ;;
-              "-m"|"--remote")
+            "-m"|"--remote")
                 shift
                 remote="$1"
                 ;;
-              "-p"|"--prerelease")
+            "-p"|"--prerelease")
                 shift
                 prerelease="true"
                 ;;
@@ -1305,8 +1543,10 @@ cmd_release() {
     validate_version "$version"
     validate_repo "$owner" "$repo"
 
-    # Obtain the current branch.
-    branch=$(get_branch)
+    # If branch was not provided, obtain the current branch.
+    if [[ -z "$branch" ]]; then
+      branch=$(get_branch)
+    fi
     say "Will start creating a draft release for branch $branch ..."
     get_user_confirmation || die "Aborted."
 
@@ -1314,6 +1554,8 @@ cmd_release() {
     # does not already exist. If the tag exists, we will not try to
     # post a release on GitHub.
     check_release_tag "$version" || skip_github_release=true
+
+    git checkout "$branch" || die "Could not checkout branch $branch."
 
     if [[ -z "$skip_github_release" ]]; then
         if [[ -z "$token" ]]; then
@@ -1323,7 +1565,7 @@ cmd_release() {
 
             # Start by creating a local tag and associate to it a description.
             say "Creating local tag..."
-            create_local_tag "$version" "$prev_ver" || die "Could not create local tag v$version."
+            create_local_tag "$version" "$prev_ver" "$branch" || die "Could not create local tag v$version."
 
             # From now on, any function that will fail will also need to revert creation of local tag.
             say "Continue with remote tag push?"
@@ -1334,7 +1576,7 @@ cmd_release() {
             get_user_confirmation || delete_remote_tag "$version" "$remote" "Could not post release to GitHub."
 
             release_text=$(compose_release_text "$version" "$prev_ver")
-            post_release "$version" "$branch" "$owner" "$repo" "$token" "$prerelease" "$release_text" ||
+            post_release "$version" "$owner" "$repo" "$token" "$prerelease" "$release_text" ||
             delete_remote_tag "$version" "$remote" "Could not post release to GitHub."
             say "Draft release created successful. Go to https://github.com/$owner/$repo/releases to check it out!"
     fi
@@ -1347,6 +1589,7 @@ fi
 create_local_tag() {
     version="$1"
     prev_ver="$2"
+    branch="$3"
 
     # Create tag.
     say "Obtaining tag description for local tag v$version..."
@@ -1356,7 +1599,7 @@ create_local_tag() {
     say "Continue with tag creation?"
     get_user_confirmation || die "Local v$version not created."
 
-    git tag -a v"$version" -m "$tag_text"
+    git tag -a v"$version" "$branch" -m "$tag_text"
     ok_or_die "Local tag v$version not created."
     say "Local tag v$version created."
 }
@@ -1411,15 +1654,15 @@ cmd_upload_assets() {
                 shift
                 local token="$1"
                 ;;
-             "-o"|"--owner")
+            "-o"|"--owner")
                 shift
                 owner="$1"
                 ;;
-              "-r"|"--repo")
+            "-r"|"--repo")
                 shift
                 repo="$1"
                 ;;
-              "-a"|"--asset")
+            "-a"|"--asset")
                 shift
                 assets+=( "$1" )
                 ;;
@@ -1660,12 +1903,15 @@ generate_syscall_table_aarch64() {
         --user "$(id -u):$(id -g)" \
         --workdir "$CTR_KERNEL_DIR" \
         -- \
-            gcc -E -dM -D__ARCH_WANT_RENAMEAT -D__BITS_PER_LONG=64\
-                linux/arch/arm64/include/uapi/asm/unistd.h | grep "#define __NR_" |\
-                grep -v "__NR_syscalls" | grep -v "__NR_arch_specific_syscall" |\
-                awk -F '__NR_' '{print $2}' | sed $replace |\
+            gcc -Ilinux/include/uapi -E -dM -D__ARCH_WANT_RENAMEAT\
+                -D__BITS_PER_LONG=64\
+                linux/arch/arm64/include/uapi/asm/unistd.h |\
+                grep "#define __NR_" | grep -v "__NR_syscalls" |\
+                grep -v "__NR_arch_specific_syscall" |\
+                awk -F '__NR_' '{print $2}' |\
+                sed $replace |\
                 awk '{ print "    map.insert(\""$1"\".to_string(), "$2");" }' |\
-                sort >> $path_to_rust_file
+                sort -d >> $path_to_rust_file
     ret=$?
 
     [ $ret -ne 0 ] && return $ret
@@ -1774,17 +2020,20 @@ cmd_install() {
     ensure_release_binaries_exist $target $profile
 
     say "Installing firecracker in $install_path"
-    install -m 755 "$CARGO_TARGET_DIR/$target/$profile/firecracker" "$install_path"
+    install -m 755 "$( build_fc_bin_path "$target" "$profile")" "$install_path"
 
     say "Installing jailer in $install_path"
-    install -m 755 "$CARGO_TARGET_DIR/$target/$profile/jailer" "$install_path"
+    install -m 755 "$( build_jailer_bin_path "$target" "$profile")" "$install_path"
 
     say "Installing seccomp in $install_path"
-    install -m 755 "$CARGO_SECCOMPILER_TARGET_DIR/$target/$profile/seccompiler-bin" "$install_path"
+    install -m 755 "$( build_seccomp_bin_path "$target" "$profile")" "$install_path"
+
+    say "Installing rebase-snap in $install_path"
+    install -m 755 "$( build_rebase_snap_bin_path "$target" "$profile")" "$install_path"
 }
 
 # Build a Firecracker CI compatible kernel image.
-# Example: `./tools/devtool build_kernel -c resources/microvm-kernel-arm64.config`
+# Example: `./tools/devtool build_kernel -c resources/guest_configs/microvm-kernel-arm64-4.14.config`
 #
 cmd_build_kernel() {
     nprocs=$(getconf _NPROCESSORS_ONLN)
@@ -1829,7 +2078,7 @@ cmd_build_kernel() {
     create_dir "$kernel_dir_host"
 
     # Extract the kernel version from the config file provided as parameter.
-    KERNEL_VERSION=$(cat "$KERNEL_CFG" | grep -Po "^# Linux\/$cfg_pattern (([0-9]+.){2}[0-9]+)" | cut -d ' ' -f 3)
+    KERNEL_VERSION=$(cat "$KERNEL_CFG" | grep -Po "^# Linux\/$cfg_pattern (([0-9]+.)[0-9]+)" | cut -d ' ' -f 3)
     validate_kernel_version "$KERNEL_VERSION"
 
     recipe_commit="b551cccc405a73a6d316c0c09dfe0b3e7a73ba3f"
@@ -1851,12 +2100,12 @@ cmd_build_kernel() {
     say "Kernel binary placed in: $kernel_dir_host/linux-$KERNEL_VERSION/$KERNEL_BINARY_NAME"
 }
 
-# `./devtool build_rootfs -s 500`
+# `./devtool build_rootfs -s 500MB`
 # Build a rootfs of custom size.
 #
 cmd_build_rootfs() {
-    # Default size for the resulting rootfs image is 250M.
-    SIZE="300"
+    # Default size for the resulting rootfs image is 300MB.
+    SIZE="300MB"
     FROM_CTR=ubuntu:18.04
     flavour="bionic"
 
@@ -1894,7 +2143,16 @@ cmd_build_rootfs() {
         gcc -o  $rootfs_dir_ctr/readmem $resources_dir_ctr/readmem.c"
 
     img_file="$rootfs_dir_host/$ROOTFS_NAME"
-    dd if=/dev/zero "of=$img_file" bs=1M count=$SIZE
+
+    # Check for pre-existence of rootfs image. See if we are allowed
+    # to delete it. If not, abort.
+    if [ -f "$img_file" ]; then
+        say "Rootfs image $img_file already exists. Do you want us to delete it for you?"
+        get_user_confirmation || die "Aborted."
+        rm -f "$img_file"
+    fi
+
+    truncate -s "$SIZE" "$img_file"
     mkfs.ext4 -F "$img_file"
     docker run --env ROOTFS_NAME=$ROOTFS_NAME --env PARTUUID=$PARTUUID --privileged --rm -i -v "$FC_ROOT_DIR:/firecracker"  "$FROM_CTR" bash -s <<'EOF'
 rootfs_dir=/firecracker/build/rootfs

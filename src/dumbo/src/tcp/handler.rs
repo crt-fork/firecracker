@@ -196,18 +196,18 @@ impl TcpIPv4Handler {
         self.max_connections
     }
 
-    /// Returns the max pending resetes of this TCP handler.
+    /// Returns the max pending resets of this TCP handler.
     pub fn max_pending_resets(&self) -> usize {
         self.max_pending_resets
     }
 
     /// Contains logic for handling incoming segments.
     ///
-    /// Any changes to the state if the handler are communicated through an `Ok(RecvEvent)`.
-    pub fn receive_packet<T: NetworkBytes>(
+    /// Any changes to the state of the handler are communicated through an `Ok(RecvEvent)`.
+    pub fn receive_packet<T: NetworkBytes, F: FnOnce(Request) -> Response>(
         &mut self,
         packet: &IPv4Packet<T>,
-        callback: fn(Request) -> Response,
+        callback: F,
     ) -> Result<RecvEvent, RecvError> {
         // TODO: We skip verifying the checksum, just in case the device model relies on offloading
         // checksum computation from the guest to some other entity. Clear this up at some point!
